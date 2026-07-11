@@ -63,7 +63,7 @@ async function generateVoice(text, voiceId, outPath) {
 // or uploaded image), gets normalized to exactly this, so scenes never mismatch when concatenated.
 const FRAME_W = 1280;
 const FRAME_H = 720;
-const SCALE_PAD = `scale=${FRAME_W}:${FRAME_H}:force_original_aspect_ratio=decrease,pad=${FRAME_W}:${FRAME_H}:(ow-iw)/2:(oh-ih)/2:color=black`;
+const SCALE_PAD = `scale=${FRAME_W}:${FRAME_H}:force_original_aspect_ratio=decrease,pad=${FRAME_W}:${FRAME_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
 
 // Loops (if the source is shorter) or trims (if longer) a video to an exact target duration,
 // while normalizing it to the common frame size — used for both Runway output and uploaded
@@ -326,7 +326,7 @@ async function applyFinalAdjustments(inputPath, outputPath, opts) {
 
   const videoFilters = [];
   if (target && target.width && target.height) {
-    videoFilters.push(`scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease,pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2:color=black`);
+    videoFilters.push(`scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease,pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`);
   }
   if (brightness !== 0 || contrast !== 1 || saturation !== 1) {
     videoFilters.push(`eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}`);
