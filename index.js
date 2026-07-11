@@ -57,6 +57,18 @@ async function generateVoice(text, voiceId, outPath) {
     });
     audioStream.on("error", reject);
   });
+  // A real MP3 with any actual speech in it is at minimum a few KB. A file this small almost
+  // always means the TTS engine returned little or no real audio — most commonly because the
+  // narration's language doesn't match the selected voice (e.g. Hindi/Devanagari text sent to
+  // an English-only voice). Fail here with a clear reason instead of letting a near-empty file
+  // silently corrupt the merge step several stages later with a confusing ffmpeg error.
+  const stats = fs.statSync(outPath);
+  if (stats.size < 2000) {
+    throw new Error(
+      `Voice generation produced almost no audio (${stats.size} bytes) for voice "${voiceId || DEFAULT_VOICE_ID}". ` +
+      `This usually means the narration's language doesn't match the selected voice — for example, Hindi text sent to an English voice. Try a voice that matches the narration's actual language.`
+    );
+  }
 }
 
 // Common target frame — every scene's visual, regardless of source (Runway, uploaded video,
