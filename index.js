@@ -484,25 +484,44 @@ app.use("/files", express.static(OUTPUT_DIR));
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 // Reports real memory numbers so we can confirm or rule out a container memory limit
-// instead of guessing from crash symptoms alone.
+// instead of guessing from crash symptoms alone. Reads the cgroup memory limit directly —
+// /proc/meminfo reports the HOST's total memory, not this container's actual allocation,
+// which is misleading on any containerized platform (Railway included).
+function readContainerMemory() {
+  const result = { limitMB: null, usedMB: null, source: null };
+  try {
+    const v2max = fs.readFileSync("/sys/fs/cgroup/memory.max", "utf8").trim();
+    if (v2max !== "max") {
+      result.limitMB = Math.round(Number(v2max) / 1024 / 1024);
+      result.usedMB = Math.round(Number(fs.readFileSync("/sys/fs/cgroup/memory.current", "utf8").trim()) / 1024 / 1024);
+      result.source = "cgroup v2";
+      return result;
+    }
+  } catch (e) { /* fall through to v1 */ }
+  try {
+    const v1max = Number(fs.readFileSync("/sys/fs/cgroup/memory/memory.limit_in_bytes", "utf8").trim());
+    const v1cur = Number(fs.readFileSync("/sys/fs/cgroup/memory/memory.usage_in_bytes", "utf8").trim());
+    if (v1max > 0 && v1max < 1024 ** 4) {
+      // A real, finite limit — under 1TB rules out the "effectively unlimited" sentinel value.
+      result.limitMB = Math.round(v1max / 1024 / 1024);
+      result.usedMB = Math.round(v1cur / 1024 / 1024);
+      result.source = "cgroup v1";
+    } else {
+      result.source = "cgroup v1 (no limit set)";
+      result.usedMB = Math.round(v1cur / 1024 / 1024);
+    }
+  } catch (e) {
+    result.source = "unavailable: " + e.message;
+  }
+  return result;
+}
+
 app.get("/diagnostics", (req, res) => {
   const mem = process.memoryUsage();
   const toMB = (bytes) => Math.round(bytes / 1024 / 1024);
-  let systemMemory = null;
-  try {
-    const meminfo = fs.readFileSync("/proc/meminfo", "utf8");
-    const total = meminfo.match(/MemTotal:\s+(\d+) kB/);
-    const available = meminfo.match(/MemAvailable:\s+(\d+) kB/);
-    systemMemory = {
-      totalMB: total ? Math.round(Number(total[1]) / 1024) : null,
-      availableMB: available ? Math.round(Number(available[1]) / 1024) : null,
-    };
-  } catch (e) {
-    systemMemory = { error: "could not read /proc/meminfo" };
-  }
   res.json({
     processMemoryMB: { rss: toMB(mem.rss), heapUsed: toMB(mem.heapUsed) },
-    systemMemory,
+    containerMemory: readContainerMemory(),
     outputDirFileCount: fs.readdirSync(OUTPUT_DIR).length,
     activeJob: working,
     queueLength: queue.length,
