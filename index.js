@@ -63,17 +63,23 @@ async function generateVoice(text, voiceId, outPath) {
 // or uploaded image), gets normalized to exactly this, so scenes never mismatch when concatenated.
 const FRAME_W = 1280;
 const FRAME_H = 720;
+const FRAME_RATE = 25;
 const SCALE_PAD = `scale=${FRAME_W}:${FRAME_H}:force_original_aspect_ratio=decrease,pad=${FRAME_W}:${FRAME_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
 
 // Loops (if the source is shorter) or trims (if longer) a video to an exact target duration,
 // while normalizing it to the common frame size — used for both Runway output and uploaded
 // video files, so every scene's visual duration matches its narration exactly, never truncating
-// or overrunning it.
+// or overrunning it. Also forces a consistent frame rate: without this, a 30fps phone video
+// and a Runway clip at its own native rate would produce scenes with different frame rates,
+// which corrupts timestamps throughout the file the moment they're concatenated together
+// (confirmed by reproducing it directly — this was the actual cause of the recurring,
+// seemingly random ffmpeg crashes during export).
 async function normalizeVideoToDuration(srcPath, outPath, targetDuration) {
   await ffmpeg([
     "-stream_loop", "-1", "-i", srcPath,
     "-vf", `${SCALE_PAD},format=yuv420p`,
     "-t", String(targetDuration),
+    "-r", String(FRAME_RATE),
     "-c:v", "libx264",
     "-preset", "veryfast",
     "-an",
@@ -144,11 +150,11 @@ async function prepareUploadedVisual(filenames, audioPath, outPath) {
     } else {
       // Still image — normalize to the common frame, then animate with a gentle Ken Burns
       // zoom for its share of the narration.
-      const frames = Math.max(25, Math.round(perClip * 25));
+      const frames = Math.max(FRAME_RATE, Math.round(perClip * FRAME_RATE));
       await ffmpeg([
         "-loop", "1", "-i", srcPath,
         "-vf", `${SCALE_PAD},zoompan=z='min(zoom+0.0008,1.15)':d=${frames}:s=${FRAME_W}x${FRAME_H},format=yuv420p`,
-        "-t", String(perClip), "-r", "25",
+        "-t", String(perClip), "-r", String(FRAME_RATE),
         "-c:v", "libx264", "-preset", "veryfast",
         clipPath,
       ]);
@@ -347,7 +353,7 @@ async function applyFinalAdjustments(inputPath, outputPath, opts) {
   const args = ["-i", inputPath];
   if (videoFilters.length) args.push("-vf", videoFilters.join(","));
   if (audioFilters.length) args.push("-af", audioFilters.join(","));
-  args.push("-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", outputPath);
+  args.push("-r", String(FRAME_RATE), "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", outputPath);
   await ffmpeg(args);
 }
 
