@@ -75,6 +75,7 @@ async function normalizeVideoToDuration(srcPath, outPath, targetDuration) {
     "-vf", `${SCALE_PAD},format=yuv420p`,
     "-t", String(targetDuration),
     "-c:v", "libx264",
+    "-preset", "veryfast",
     "-an",
     outPath,
   ]);
@@ -148,6 +149,7 @@ async function prepareUploadedVisual(filenames, audioPath, outPath) {
         "-loop", "1", "-i", srcPath,
         "-vf", `${SCALE_PAD},zoompan=z='min(zoom+0.0008,1.15)':d=${frames}:s=${FRAME_W}x${FRAME_H},format=yuv420p`,
         "-t", String(perClip), "-r", "25",
+        "-c:v", "libx264", "-preset", "veryfast",
         clipPath,
       ]);
     }
@@ -224,6 +226,7 @@ async function mergeSceneAV(videoPath, audioPath, outPath, captionText) {
       "-i", audioPath,
       "-vf", drawtext,
       "-c:v", "libx264",
+      "-preset", "veryfast",
       "-c:a", "aac",
       "-shortest",
       "-movflags", "+faststart",
@@ -303,17 +306,27 @@ const PLATFORM_PRESETS = {
   twitter: { label: "X / Twitter (16:9)", width: 1280, height: 720 },
 };
 
-// One pass: resize for a target platform (letterboxed, never stretched), adjust
-// brightness/contrast/saturation, and change playback speed — video and audio together so
-// they stay in sync. Any combination can be a no-op; only the filters actually needed run.
+// Plain 16:9 resolution tiers — used only when no platform preset (which has its own
+// aspect-specific dimensions) is selected.
+const RESOLUTION_TIERS = {
+  "720p": { width: 1280, height: 720 },
+  "1080p": { width: 1920, height: 1080 },
+  "4K": { width: 3840, height: 2160 },
+};
+
+// One pass: resize (platform preset takes priority; otherwise the plain resolution tier),
+// adjust brightness/contrast/saturation, and change playback speed — video and audio
+// together so they stay in sync. Any combination can be a no-op; only the filters actually
+// needed run.
 async function applyFinalAdjustments(inputPath, outputPath, opts) {
-  const { speed = 1, platformPreset = "none", brightness = 0, contrast = 1, saturation = 1 } = opts || {};
-  const preset = PLATFORM_PRESETS[platformPreset] || PLATFORM_PRESETS.none;
+  const { speed = 1, platformPreset = "none", resolution, brightness = 0, contrast = 1, saturation = 1 } = opts || {};
+  const platform = PLATFORM_PRESETS[platformPreset] || PLATFORM_PRESETS.none;
+  const target = platform.width && platform.height ? platform : (RESOLUTION_TIERS[resolution] || null);
   const speedClamped = Math.max(0.25, Math.min(4, Number(speed) || 1));
 
   const videoFilters = [];
-  if (preset.width && preset.height) {
-    videoFilters.push(`scale=${preset.width}:${preset.height}:force_original_aspect_ratio=decrease,pad=${preset.width}:${preset.height}:(ow-iw)/2:(oh-ih)/2:color=black`);
+  if (target && target.width && target.height) {
+    videoFilters.push(`scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease,pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2:color=black`);
   }
   if (brightness !== 0 || contrast !== 1 || saturation !== 1) {
     videoFilters.push(`eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}`);
@@ -334,7 +347,7 @@ async function applyFinalAdjustments(inputPath, outputPath, opts) {
   const args = ["-i", inputPath];
   if (videoFilters.length) args.push("-vf", videoFilters.join(","));
   if (audioFilters.length) args.push("-af", audioFilters.join(","));
-  args.push("-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", outputPath);
+  args.push("-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", outputPath);
   await ffmpeg(args);
 }
 
@@ -392,7 +405,7 @@ async function tick() {
     } else if (job.type === "final_export") {
       const {
         sceneFiles, musicFile, musicVolume,
-        speed, platformPreset, brightness, contrast, saturation,
+        speed, platformPreset, resolution, brightness, contrast, saturation,
         exportFormat,
       } = job.payload; // sceneFiles: filenames already in OUTPUT_DIR
       const concatPath = path.join(OUTPUT_DIR, `concat-${job.id}.mp4`);
@@ -413,7 +426,7 @@ async function tick() {
       }
       job.progress = 55;
 
-      await applyFinalAdjustments(postMusicPath, adjustedPath, { speed, platformPreset, brightness, contrast, saturation });
+      await applyFinalAdjustments(postMusicPath, adjustedPath, { speed, platformPreset, resolution, brightness, contrast, saturation });
       fs.unlinkSync(postMusicPath);
       job.progress = 80;
 
@@ -494,13 +507,13 @@ app.get("/platform-presets", (req, res) => {
 });
 
 app.post("/jobs/export", (req, res) => {
-  const { sceneFiles, musicFile, musicVolume, speed, platformPreset, brightness, contrast, saturation, exportFormat } = req.body || {};
+  const { sceneFiles, musicFile, musicVolume, speed, platformPreset, resolution, brightness, contrast, saturation, exportFormat } = req.body || {};
   if (!Array.isArray(sceneFiles) || sceneFiles.length === 0) {
     return res.status(400).json({ error: "sceneFiles must be a non-empty array of filenames from prior scene_generate jobs" });
   }
   const id = createJob("final_export", {
     sceneFiles, musicFile, musicVolume,
-    speed, platformPreset, brightness, contrast, saturation,
+    speed, platformPreset, resolution, brightness, contrast, saturation,
     exportFormat,
   });
   res.json({ jobId: id });
