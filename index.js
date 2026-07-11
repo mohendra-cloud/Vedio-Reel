@@ -302,14 +302,15 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 app.use("/files", express.static(OUTPUT_DIR));
 
+// Public — no token needed, so uptime checks and a quick browser visit both work.
+app.get("/health", (req, res) => res.json({ ok: true }));
+
 app.use((req, res, next) => {
   if (!ACCESS_TOKEN) return next(); // no token configured — open access, fine for local dev only
   const auth = req.headers.authorization || "";
   if (auth === `Bearer ${ACCESS_TOKEN}`) return next();
   res.status(401).json({ error: "missing or invalid Authorization header" });
 });
-
-app.get("/health", (req, res) => res.json({ ok: true }));
 
 // Text generation (script rewrite, scene breakdown, style/music suggestions, etc.)
 // Runs server-side so the Gemini key never touches the browser.
