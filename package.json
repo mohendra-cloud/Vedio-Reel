@@ -1,0 +1,21 @@
+{
+  "name": "reelforge-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "ReelForge render worker + API — free Gemini text, free Edge TTS voice, Runway or your own uploads for video, merged with ffmpeg.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@runwayml/sdk": "^1.3.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "msedge-tts": "^2.0.7",
+    "multer": "^2.2.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
