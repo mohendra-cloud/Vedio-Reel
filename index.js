@@ -353,7 +353,7 @@ async function applyFinalAdjustments(inputPath, outputPath, opts) {
   const args = ["-i", inputPath];
   if (videoFilters.length) args.push("-vf", videoFilters.join(","));
   if (audioFilters.length) args.push("-af", audioFilters.join(","));
-  args.push("-r", String(FRAME_RATE), "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-movflags", "+faststart", outputPath);
+  args.push("-r", String(FRAME_RATE), "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-x264-params", "threads=2:lookahead-threads=1", "-c:a", "aac", "-movflags", "+faststart", outputPath);
   await ffmpeg(args);
 }
 
@@ -482,6 +482,32 @@ app.use("/files", express.static(OUTPUT_DIR));
 
 // Public — no token needed, so uptime checks and a quick browser visit both work.
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// Reports real memory numbers so we can confirm or rule out a container memory limit
+// instead of guessing from crash symptoms alone.
+app.get("/diagnostics", (req, res) => {
+  const mem = process.memoryUsage();
+  const toMB = (bytes) => Math.round(bytes / 1024 / 1024);
+  let systemMemory = null;
+  try {
+    const meminfo = fs.readFileSync("/proc/meminfo", "utf8");
+    const total = meminfo.match(/MemTotal:\s+(\d+) kB/);
+    const available = meminfo.match(/MemAvailable:\s+(\d+) kB/);
+    systemMemory = {
+      totalMB: total ? Math.round(Number(total[1]) / 1024) : null,
+      availableMB: available ? Math.round(Number(available[1]) / 1024) : null,
+    };
+  } catch (e) {
+    systemMemory = { error: "could not read /proc/meminfo" };
+  }
+  res.json({
+    processMemoryMB: { rss: toMB(mem.rss), heapUsed: toMB(mem.heapUsed) },
+    systemMemory,
+    outputDirFileCount: fs.readdirSync(OUTPUT_DIR).length,
+    activeJob: working,
+    queueLength: queue.length,
+  });
+});
 
 app.use((req, res, next) => {
   if (!ACCESS_TOKEN) return next(); // no token configured — open access, fine for local dev only
