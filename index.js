@@ -59,7 +59,28 @@ async function generateVoice(text, voiceId, outPath) {
   });
 }
 
-async function generateVisual(promptText, outPath) {
+// Common target frame — every scene's visual, regardless of source (Runway, uploaded video,
+// or uploaded image), gets normalized to exactly this, so scenes never mismatch when concatenated.
+const FRAME_W = 1280;
+const FRAME_H = 720;
+const SCALE_PAD = `scale=${FRAME_W}:${FRAME_H}:force_original_aspect_ratio=decrease,pad=${FRAME_W}:${FRAME_H}:(ow-iw)/2:(oh-ih)/2:color=black`;
+
+// Loops (if the source is shorter) or trims (if longer) a video to an exact target duration,
+// while normalizing it to the common frame size — used for both Runway output and uploaded
+// video files, so every scene's visual duration matches its narration exactly, never truncating
+// or overrunning it.
+async function normalizeVideoToDuration(srcPath, outPath, targetDuration) {
+  await ffmpeg([
+    "-stream_loop", "-1", "-i", srcPath,
+    "-vf", `${SCALE_PAD},format=yuv420p`,
+    "-t", String(targetDuration),
+    "-c:v", "libx264",
+    "-an",
+    outPath,
+  ]);
+}
+
+async function generateVisual(promptText, outPath, targetDuration) {
   if (!runway) throw new Error("RUNWAYML_API_SECRET is not set on the backend");
   const task = await runway.textToVideo
     .create({ promptText, model: "gen4.5", ratio: "1280:720", duration: 5 })
@@ -68,7 +89,12 @@ async function generateVisual(promptText, outPath) {
   if (!videoUrl) throw new Error("Runway task finished with no output video");
   const res = await fetch(videoUrl);
   const buf = Buffer.from(await res.arrayBuffer());
-  fs.writeFileSync(outPath, buf);
+  const rawPath = outPath.replace(/\.mp4$/, "-raw.mp4");
+  fs.writeFileSync(rawPath, buf);
+  // Runway always returns a fixed ~5s clip — loop/trim it to match this scene's actual
+  // narration length exactly, so longer narration never gets cut off mid-sentence.
+  await normalizeVideoToDuration(rawPath, outPath, targetDuration);
+  fs.unlinkSync(rawPath);
 }
 
 function ffprobeDuration(filePath) {
@@ -91,26 +117,48 @@ function ffprobeDuration(filePath) {
 
 const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".webm", ".m4v", ".avi"]);
 
-// Turns a manually uploaded image or video into a clip matching the narration's length —
-// the free, no-API-key alternative to calling Runway for a scene's visual.
-async function prepareUploadedVisual(filename, audioPath, outPath) {
-  const srcPath = path.join(OUTPUT_DIR, filename);
-  if (!fs.existsSync(srcPath)) throw new Error(`Uploaded file not found: ${filename}`);
+// Turns manually uploaded images/videos into a single clip matching the narration's length —
+// the free, no-API-key alternative to calling Runway for a scene's visual. Accepts one file,
+// or an array — multiple files split the scene's duration evenly and play in sequence. Every
+// file, whatever its original resolution or aspect ratio, gets normalized to the same common
+// frame (letterboxed/pillarboxed, never stretched or distorted) so scenes always concatenate
+// cleanly no matter what mix of photos and videos went into them.
+async function prepareUploadedVisual(filenames, audioPath, outPath) {
+  const list = Array.isArray(filenames) ? filenames : [filenames];
+  if (list.length === 0) throw new Error("No uploaded visual files given for this scene");
   const duration = await ffprobeDuration(audioPath);
-  const ext = path.extname(filename).toLowerCase();
+  const perClip = duration / list.length;
+  const tempBase = outPath.replace(/\.mp4$/, "");
+  const clipPaths = [];
 
-  if (VIDEO_EXTENSIONS.has(ext)) {
-    // Loop (if shorter) or trim (if longer) the uploaded video to match the narration.
-    await ffmpeg(["-stream_loop", "-1", "-i", srcPath, "-t", String(duration), "-c:v", "libx264", "-an", outPath]);
+  for (let i = 0; i < list.length; i++) {
+    const filename = list[i];
+    const srcPath = path.join(OUTPUT_DIR, filename);
+    if (!fs.existsSync(srcPath)) throw new Error(`Uploaded file not found: ${filename}`);
+    const ext = path.extname(filename).toLowerCase();
+    const clipPath = `${tempBase}-part${i}.mp4`;
+
+    if (VIDEO_EXTENSIONS.has(ext)) {
+      await normalizeVideoToDuration(srcPath, clipPath, perClip);
+    } else {
+      // Still image — normalize to the common frame, then animate with a gentle Ken Burns
+      // zoom for its share of the narration.
+      const frames = Math.max(25, Math.round(perClip * 25));
+      await ffmpeg([
+        "-loop", "1", "-i", srcPath,
+        "-vf", `${SCALE_PAD},zoompan=z='min(zoom+0.0008,1.15)':d=${frames}:s=${FRAME_W}x${FRAME_H},format=yuv420p`,
+        "-t", String(perClip), "-r", "25",
+        clipPath,
+      ]);
+    }
+    clipPaths.push(clipPath);
+  }
+
+  if (clipPaths.length === 1) {
+    fs.renameSync(clipPaths[0], outPath);
   } else {
-    // Still image — animate with a gentle Ken Burns zoom for the length of the narration.
-    const frames = Math.max(25, Math.round(duration * 25));
-    await ffmpeg([
-      "-loop", "1", "-i", srcPath,
-      "-vf", `zoompan=z='min(zoom+0.0008,1.15)':d=${frames}:s=1280x720,format=yuv420p`,
-      "-t", String(duration), "-r", "25",
-      outPath,
-    ]);
+    await concatScenes(clipPaths, outPath);
+    clipPaths.forEach((p) => fs.existsSync(p) && fs.unlinkSync(p));
   }
 }
 
@@ -178,6 +226,7 @@ async function mergeSceneAV(videoPath, audioPath, outPath, captionText) {
       "-c:v", "libx264",
       "-c:a", "aac",
       "-shortest",
+      "-movflags", "+faststart",
       outPath,
     ]);
   } else {
@@ -187,6 +236,7 @@ async function mergeSceneAV(videoPath, audioPath, outPath, captionText) {
       "-c:v", "copy",
       "-c:a", "aac",
       "-shortest",
+      "-movflags", "+faststart",
       outPath,
     ]);
   }
@@ -196,7 +246,11 @@ async function mergeSceneAV(videoPath, audioPath, outPath, captionText) {
 async function concatScenes(clipPaths, outPath) {
   const listFile = path.join(OUTPUT_DIR, `concat-${randomUUID()}.txt`);
   fs.writeFileSync(listFile, clipPaths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join("\n"));
-  await ffmpeg(["-f", "concat", "-safe", "0", "-i", listFile, "-c", "copy", outPath]);
+  // Video is fast-copied (all inputs are already normalized to the same codec/resolution by
+  // this point); audio is re-encoded rather than copied, which avoids timestamp drift at the
+  // splice points between scenes. +faststart lets the file start playing before it's fully
+  // downloaded, so the preview players in the app show something immediately.
+  await ffmpeg(["-f", "concat", "-safe", "0", "-i", listFile, "-c:v", "copy", "-c:a", "aac", "-movflags", "+faststart", outPath]);
   fs.unlinkSync(listFile);
 }
 
@@ -237,6 +291,70 @@ async function mixBackgroundMusic(videoPath, musicFilename, outPath, volume) {
   ]);
 }
 
+// Resolution + aspect ratio targets for common platforms. `null` width/height means
+// "leave the resolution as-is." Exported so the frontend can show the same list.
+const PLATFORM_PRESETS = {
+  none: { label: "Original — no resizing", width: null, height: null },
+  instagram_reel: { label: "Instagram Reels / TikTok (9:16)", width: 1080, height: 1920 },
+  instagram_feed: { label: "Instagram Feed post (1:1)", width: 1080, height: 1080 },
+  youtube: { label: "YouTube (16:9)", width: 1920, height: 1080 },
+  youtube_shorts: { label: "YouTube Shorts (9:16)", width: 1080, height: 1920 },
+  facebook: { label: "Facebook video (16:9)", width: 1280, height: 720 },
+  twitter: { label: "X / Twitter (16:9)", width: 1280, height: 720 },
+};
+
+// One pass: resize for a target platform (letterboxed, never stretched), adjust
+// brightness/contrast/saturation, and change playback speed — video and audio together so
+// they stay in sync. Any combination can be a no-op; only the filters actually needed run.
+async function applyFinalAdjustments(inputPath, outputPath, opts) {
+  const { speed = 1, platformPreset = "none", brightness = 0, contrast = 1, saturation = 1 } = opts || {};
+  const preset = PLATFORM_PRESETS[platformPreset] || PLATFORM_PRESETS.none;
+  const speedClamped = Math.max(0.25, Math.min(4, Number(speed) || 1));
+
+  const videoFilters = [];
+  if (preset.width && preset.height) {
+    videoFilters.push(`scale=${preset.width}:${preset.height}:force_original_aspect_ratio=decrease,pad=${preset.width}:${preset.height}:(ow-iw)/2:(oh-ih)/2:color=black`);
+  }
+  if (brightness !== 0 || contrast !== 1 || saturation !== 1) {
+    videoFilters.push(`eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}`);
+  }
+  if (speedClamped !== 1) {
+    videoFilters.push(`setpts=${(1 / speedClamped).toFixed(6)}*PTS`);
+  }
+
+  const audioFilters = [];
+  if (speedClamped !== 1) {
+    // ffmpeg's atempo filter only accepts 0.5–2.0 per instance; chain multiple to cover a wider range.
+    let remaining = speedClamped;
+    while (remaining > 2.0) { audioFilters.push("atempo=2.0"); remaining /= 2.0; }
+    while (remaining < 0.5) { audioFilters.push("atempo=0.5"); remaining /= 0.5; }
+    audioFilters.push(`atempo=${remaining.toFixed(6)}`);
+  }
+
+  const args = ["-i", inputPath];
+  if (videoFilters.length) args.push("-vf", videoFilters.join(","));
+  if (audioFilters.length) args.push("-af", audioFilters.join(","));
+  args.push("-c:v", "libx264", "-c:a", "aac", "-movflags", "+faststart", outputPath);
+  await ffmpeg(args);
+}
+
+// Two-pass GIF conversion (palette generation, then reuse) — much better color quality
+// than a naive single-pass GIF encode. GIFs have no audio track.
+async function convertToGif(inputPath, outputPath) {
+  const palettePath = outputPath.replace(/\.gif$/, "-palette.png");
+  await ffmpeg(["-i", inputPath, "-vf", "fps=10,scale=480:-1:flags=lanczos,palettegen", palettePath]);
+  await ffmpeg([
+    "-i", inputPath, "-i", palettePath,
+    "-filter_complex", "fps=10,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse",
+    outputPath,
+  ]);
+  fs.unlinkSync(palettePath);
+}
+
+async function convertToWebm(inputPath, outputPath) {
+  await ffmpeg(["-i", inputPath, "-c:v", "libvpx-vp9", "-c:a", "libopus", "-b:v", "1M", outputPath]);
+}
+
 // --- worker loop: pulls one job at a time. Swap for BullMQ/Redis if you need parallel workers later. ---
 let working = false;
 async function tick() {
@@ -247,7 +365,7 @@ async function tick() {
   try {
     job.status = "processing";
     if (job.type === "scene_generate") {
-      const { sceneId, narration, imagePrompt, voiceId, visualFile, showCaptions, sfxFile } = job.payload;
+      const { sceneId, narration, imagePrompt, voiceId, visualFiles, showCaptions, sfxFile } = job.payload;
       const audioPath = path.join(OUTPUT_DIR, `${sceneId}-voice.mp3`);
       const audioMixedPath = path.join(OUTPUT_DIR, `${sceneId}-voice-mixed.mp3`);
       const videoPath = path.join(OUTPUT_DIR, `${sceneId}-visual.mp4`);
@@ -260,10 +378,11 @@ async function tick() {
         finalAudioPath = audioMixedPath;
       }
       job.progress = 40;
-      if (visualFile) {
-        await prepareUploadedVisual(visualFile, finalAudioPath, videoPath);
+      if (visualFiles && visualFiles.length > 0) {
+        await prepareUploadedVisual(visualFiles, finalAudioPath, videoPath);
       } else {
-        await generateVisual(imagePrompt, videoPath);
+        const targetDuration = await ffprobeDuration(finalAudioPath);
+        await generateVisual(imagePrompt, videoPath, targetDuration);
       }
       job.progress = 75;
       await mergeSceneAV(videoPath, finalAudioPath, mergedPath, showCaptions ? narration : null);
@@ -271,18 +390,45 @@ async function tick() {
       job.resultUrl = `/files/${path.basename(mergedPath)}`;
       job.status = "complete";
     } else if (job.type === "final_export") {
-      const { sceneFiles, musicFile, musicVolume } = job.payload; // sceneFiles: filenames already in OUTPUT_DIR
+      const {
+        sceneFiles, musicFile, musicVolume,
+        speed, platformPreset, brightness, contrast, saturation,
+        exportFormat,
+      } = job.payload; // sceneFiles: filenames already in OUTPUT_DIR
       const concatPath = path.join(OUTPUT_DIR, `concat-${job.id}.mp4`);
-      const finalPath = path.join(OUTPUT_DIR, `export-${job.id}.mp4`);
+      const musicedPath = path.join(OUTPUT_DIR, `music-${job.id}.mp4`);
+      const adjustedPath = path.join(OUTPUT_DIR, `adjusted-${job.id}.mp4`);
+      const finalExt = exportFormat === "GIF" ? "gif" : exportFormat === "WebM" ? "webm" : exportFormat === "MOV" ? "mov" : "mp4";
+      const finalPath = path.join(OUTPUT_DIR, `export-${job.id}.${finalExt}`);
       const fullPaths = sceneFiles.map((f) => path.join(OUTPUT_DIR, f));
+
       await concatScenes(fullPaths, concatPath);
-      job.progress = 60;
+      job.progress = 35;
+
+      let postMusicPath = concatPath;
       if (musicFile) {
-        await mixBackgroundMusic(concatPath, musicFile, finalPath, musicVolume);
+        await mixBackgroundMusic(concatPath, musicFile, musicedPath, musicVolume);
         fs.unlinkSync(concatPath);
-      } else {
-        fs.renameSync(concatPath, finalPath);
+        postMusicPath = musicedPath;
       }
+      job.progress = 55;
+
+      await applyFinalAdjustments(postMusicPath, adjustedPath, { speed, platformPreset, brightness, contrast, saturation });
+      fs.unlinkSync(postMusicPath);
+      job.progress = 80;
+
+      if (exportFormat === "GIF") {
+        await convertToGif(adjustedPath, finalPath);
+        fs.unlinkSync(adjustedPath);
+      } else if (exportFormat === "WebM") {
+        await convertToWebm(adjustedPath, finalPath);
+        fs.unlinkSync(adjustedPath);
+      } else if (exportFormat === "MOV") {
+        fs.renameSync(adjustedPath, finalPath); // MOV can hold the same h264/aac stream as-is
+      } else {
+        fs.renameSync(adjustedPath, finalPath);
+      }
+
       job.progress = 100;
       job.resultUrl = `/files/${path.basename(finalPath)}`;
       job.status = "complete";
@@ -326,27 +472,37 @@ app.post("/ai/generate", async (req, res) => {
 });
 
 // Manual video path: upload your own image or video for a scene instead of paying for Runway.
-// Returns a filename to pass as visualFile in /jobs/generate-scene.
+// Returns a filename to include in the visualFiles array in /jobs/generate-scene.
 app.post("/uploads", upload.single("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "file is required (multipart field name: file)" });
   res.json({ filename: req.file.filename });
 });
 
 app.post("/jobs/generate-scene", (req, res) => {
-  const { sceneId, narration, imagePrompt, voiceId, visualFile, showCaptions, sfxFile } = req.body || {};
-  if (!sceneId || !narration || !(imagePrompt || visualFile)) {
-    return res.status(400).json({ error: "sceneId, narration, and either imagePrompt (for AI generation) or visualFile (for a manual upload) are required" });
+  const { sceneId, narration, imagePrompt, voiceId, visualFiles, showCaptions, sfxFile } = req.body || {};
+  const hasVisualFiles = Array.isArray(visualFiles) && visualFiles.length > 0;
+  if (!sceneId || !narration || !(imagePrompt || hasVisualFiles)) {
+    return res.status(400).json({ error: "sceneId, narration, and either imagePrompt (for AI generation) or visualFiles (for manual uploads) are required" });
   }
-  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, visualFile, showCaptions, sfxFile });
+  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, visualFiles, showCaptions, sfxFile });
   res.json({ jobId: id });
 });
 
+app.get("/platform-presets", (req, res) => {
+  const presets = Object.entries(PLATFORM_PRESETS).map(([id, p]) => ({ id, ...p }));
+  res.json({ presets });
+});
+
 app.post("/jobs/export", (req, res) => {
-  const { sceneFiles, musicFile, musicVolume } = req.body || {};
+  const { sceneFiles, musicFile, musicVolume, speed, platformPreset, brightness, contrast, saturation, exportFormat } = req.body || {};
   if (!Array.isArray(sceneFiles) || sceneFiles.length === 0) {
     return res.status(400).json({ error: "sceneFiles must be a non-empty array of filenames from prior scene_generate jobs" });
   }
-  const id = createJob("final_export", { sceneFiles, musicFile, musicVolume });
+  const id = createJob("final_export", {
+    sceneFiles, musicFile, musicVolume,
+    speed, platformPreset, brightness, contrast, saturation,
+    exportFormat,
+  });
   res.json({ jobId: id });
 });
 
