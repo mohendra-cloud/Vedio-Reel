@@ -44,10 +44,15 @@ function createJob(type, payload) {
 // --- free, server-side voice via Microsoft Edge's neural voices (no API key, no per-character cost) ---
 const DEFAULT_VOICE_ID = "en-US-AriaNeural";
 
-async function generateVoice(text, voiceId, outPath) {
+async function generateVoice(text, voiceOptions, outPath) {
+  const opts = voiceOptions || {};
+  const voiceId = opts.voiceId || DEFAULT_VOICE_ID;
   const tts = new MsEdgeTTS();
-  await tts.setMetadata(voiceId || DEFAULT_VOICE_ID, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
-  const { audioStream } = tts.toStream(text);
+  await tts.setMetadata(voiceId, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
+  const prosody = {};
+  if (opts.pitch) prosody.pitch = opts.pitch;
+  if (opts.rate) prosody.rate = opts.rate;
+  const { audioStream } = tts.toStream(text, prosody);
   await new Promise((resolve, reject) => {
     const chunks = [];
     audioStream.on("data", (chunk) => chunks.push(chunk));
@@ -65,7 +70,7 @@ async function generateVoice(text, voiceId, outPath) {
   const stats = fs.statSync(outPath);
   if (stats.size < 2000) {
     throw new Error(
-      `Voice generation produced almost no audio (${stats.size} bytes) for voice "${voiceId || DEFAULT_VOICE_ID}". ` +
+      `Voice generation produced almost no audio (${stats.size} bytes) for voice "${voiceId}". ` +
       `This usually means the narration's language doesn't match the selected voice — for example, Hindi text sent to an English voice. Try a voice that matches the narration's actual language.`
     );
   }
@@ -232,7 +237,11 @@ function wrapCaptionText(text, maxCharsPerLine = 42) {
   return lines.join("\n");
 }
 
-const CAPTION_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+// Noto Sans Devanagari — chosen because it renders both Devanagari script (Hindi, Sanskrit)
+// and standard Latin text correctly in the same font, confirmed by direct testing. DejaVu Sans
+// (the previous font) has no Devanagari glyphs at all, which produced garbled boxes instead of
+// text for any Hindi/Sanskrit captions.
+const CAPTION_FONT = "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf";
 
 // Merge one scene's video + narration audio into a single clip, audio trimmed/padded to video length.
 // If captionText is provided, burns it in as on-screen captions (requires a re-encode; otherwise a fast copy).
@@ -409,13 +418,13 @@ async function tick() {
   try {
     job.status = "processing";
     if (job.type === "scene_generate") {
-      const { sceneId, narration, imagePrompt, voiceId, visualFiles, showCaptions, sfxFile } = job.payload;
+      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, sfxFile } = job.payload;
       const audioPath = path.join(OUTPUT_DIR, `${sceneId}-voice.mp3`);
       const audioMixedPath = path.join(OUTPUT_DIR, `${sceneId}-voice-mixed.mp3`);
       const videoPath = path.join(OUTPUT_DIR, `${sceneId}-visual.mp4`);
       const mergedPath = path.join(OUTPUT_DIR, `${sceneId}-merged.mp4`);
 
-      await generateVoice(narration, voiceId, audioPath);
+      await generateVoice(narration, { voiceId, pitch: voicePitch, rate: voiceRate }, audioPath);
       let finalAudioPath = audioPath;
       if (sfxFile) {
         await mixSceneSfx(audioPath, sfxFile, audioMixedPath);
@@ -568,12 +577,12 @@ app.post("/uploads", upload.single("file"), (req, res) => {
 });
 
 app.post("/jobs/generate-scene", (req, res) => {
-  const { sceneId, narration, imagePrompt, voiceId, visualFiles, showCaptions, sfxFile } = req.body || {};
+  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, sfxFile } = req.body || {};
   const hasVisualFiles = Array.isArray(visualFiles) && visualFiles.length > 0;
   if (!sceneId || !narration || !(imagePrompt || hasVisualFiles)) {
     return res.status(400).json({ error: "sceneId, narration, and either imagePrompt (for AI generation) or visualFiles (for manual uploads) are required" });
   }
-  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, visualFiles, showCaptions, sfxFile });
+  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, sfxFile });
   res.json({ jobId: id });
 });
 
