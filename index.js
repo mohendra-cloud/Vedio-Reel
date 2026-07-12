@@ -89,7 +89,14 @@ const FRAME_RATE = 25;
 // video when applied at both the per-scene and export resize stages) and plain cropping
 // (fixed the black bars, but cut off real content — including the edges of burned-in
 // captions — whenever the source aspect ratio didn't match the target).
-function fitFillFilter(w, h, inLabel = "0:v", outLabel = "outv") {
+//
+// mode: "fit" (default) — full content visible, blurred fill for empty space.
+//       "fill" — crops to fill the frame completely, no blur, but can cut off content
+//       at the edges. Offered as a user choice for people who prefer a full-bleed look.
+function fitFillFilter(w, h, mode = "fit", inLabel = "0:v", outLabel = "outv") {
+  if (mode === "fill") {
+    return `[${inLabel}]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1[${outLabel}]`;
+  }
   return (
     `[${inLabel}]split=2[bg][fg];` +
     `[bg]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},gblur=sigma=25[bgb];` +
@@ -106,10 +113,10 @@ function fitFillFilter(w, h, inLabel = "0:v", outLabel = "outv") {
 // which corrupts timestamps throughout the file the moment they're concatenated together
 // (confirmed by reproducing it directly — this was the actual cause of the recurring,
 // seemingly random ffmpeg crashes during export).
-async function normalizeVideoToDuration(srcPath, outPath, targetDuration) {
+async function normalizeVideoToDuration(srcPath, outPath, targetDuration, frameFitMode) {
   await ffmpeg([
     "-stream_loop", "-1", "-i", srcPath,
-    "-filter_complex", `${fitFillFilter(FRAME_W, FRAME_H)};[outv]format=yuv420p[outv2]`,
+    "-filter_complex", `${fitFillFilter(FRAME_W, FRAME_H, frameFitMode)};[outv]format=yuv420p[outv2]`,
     "-map", "[outv2]",
     "-t", String(targetDuration),
     "-r", String(FRAME_RATE),
@@ -120,7 +127,7 @@ async function normalizeVideoToDuration(srcPath, outPath, targetDuration) {
   ]);
 }
 
-async function generateVisual(promptText, outPath, targetDuration) {
+async function generateVisual(promptText, outPath, targetDuration, frameFitMode) {
   if (!runway) throw new Error("RUNWAYML_API_SECRET is not set on the backend");
   const task = await runway.textToVideo
     .create({ promptText, model: "gen4.5", ratio: "1280:720", duration: 5 })
@@ -133,7 +140,7 @@ async function generateVisual(promptText, outPath, targetDuration) {
   fs.writeFileSync(rawPath, buf);
   // Runway always returns a fixed ~5s clip — loop/trim it to match this scene's actual
   // narration length exactly, so longer narration never gets cut off mid-sentence.
-  await normalizeVideoToDuration(rawPath, outPath, targetDuration);
+  await normalizeVideoToDuration(rawPath, outPath, targetDuration, frameFitMode);
   fs.unlinkSync(rawPath);
 }
 
@@ -163,7 +170,7 @@ const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".webm", ".m4v", ".avi"]);
 // file, whatever its original resolution or aspect ratio, gets normalized to the same common
 // frame (letterboxed/pillarboxed, never stretched or distorted) so scenes always concatenate
 // cleanly no matter what mix of photos and videos went into them.
-async function prepareUploadedVisual(filenames, audioPath, outPath) {
+async function prepareUploadedVisual(filenames, audioPath, outPath, frameFitMode) {
   const list = Array.isArray(filenames) ? filenames : [filenames];
   if (list.length === 0) throw new Error("No uploaded visual files given for this scene");
   const duration = await ffprobeDuration(audioPath);
@@ -179,14 +186,14 @@ async function prepareUploadedVisual(filenames, audioPath, outPath) {
     const clipPath = `${tempBase}-part${i}.mp4`;
 
     if (VIDEO_EXTENSIONS.has(ext)) {
-      await normalizeVideoToDuration(srcPath, clipPath, perClip);
+      await normalizeVideoToDuration(srcPath, clipPath, perClip, frameFitMode);
     } else {
       // Still image — normalize to the common frame, then animate with a gentle Ken Burns
       // zoom for its share of the narration.
       const frames = Math.max(FRAME_RATE, Math.round(perClip * FRAME_RATE));
       await ffmpeg([
         "-loop", "1", "-i", srcPath,
-        "-filter_complex", `${fitFillFilter(FRAME_W, FRAME_H)};[outv]zoompan=z='min(zoom+0.0008,1.15)':d=${frames}:s=${FRAME_W}x${FRAME_H},format=yuv420p[outv2]`,
+        "-filter_complex", `${fitFillFilter(FRAME_W, FRAME_H, frameFitMode)};[outv]zoompan=z='min(zoom+0.0008,1.15)':d=${frames}:s=${FRAME_W}x${FRAME_H},format=yuv420p[outv2]`,
         "-map", "[outv2]",
         "-t", String(perClip), "-r", String(FRAME_RATE),
         "-c:v", "libx264", "-preset", "veryfast",
@@ -265,12 +272,25 @@ function wrapCaptionText(text, maxCharsPerLine = 42) {
 const CAPTION_FONT = path.join(process.cwd(), "fonts", "NotoSansDevanagari-Bold.ttf");
 const CAPTION_SIZES = { small: 20, medium: 26, large: 34 };
 
+// Converts a "#RRGGBB" hex string to ffmpeg's "0xRRGGBB" color syntax, falling back to a
+// safe default for anything that isn't a strictly valid hex color — these values come from
+// a user-controlled color picker, so this also guards against malformed input reaching the
+// ffmpeg command.
+function toFFmpegColor(hex, fallback) {
+  if (typeof hex === "string" && /^#[0-9a-fA-F]{6}$/.test(hex)) {
+    return "0x" + hex.slice(1);
+  }
+  return fallback;
+}
+
 // Merge one scene's video + narration audio into a single clip, audio trimmed/padded to video length.
 // If captionText is provided, burns it in as on-screen captions (requires a re-encode; otherwise a fast copy).
-async function mergeSceneAV(videoPath, audioPath, outPath, captionText, captionSize) {
+async function mergeSceneAV(videoPath, audioPath, outPath, captionText, captionSize, captionFontColor, captionBgColor) {
   if (captionText && captionText.trim()) {
     const fontsize = CAPTION_SIZES[captionSize] || CAPTION_SIZES.medium;
-    const drawtext = `drawtext=fontfile=${CAPTION_FONT}:text='${escapeDrawtext(wrapCaptionText(captionText.trim()))}':fontcolor=white:fontsize=${fontsize}:line_spacing=6:box=1:boxcolor=black@0.55:boxborderw=12:x=(w-text_w)/2:y=h-th-36`;
+    const fontColor = toFFmpegColor(captionFontColor, "white");
+    const boxColor = toFFmpegColor(captionBgColor, "black") + "@0.55";
+    const drawtext = `drawtext=fontfile=${CAPTION_FONT}:text='${escapeDrawtext(wrapCaptionText(captionText.trim()))}':fontcolor=${fontColor}:fontsize=${fontsize}:line_spacing=6:box=1:boxcolor=${boxColor}:boxborderw=12:x=(w-text_w)/2:y=h-th-36`;
     await ffmpeg([
       "-i", videoPath,
       "-i", audioPath,
@@ -370,7 +390,7 @@ const RESOLUTION_TIERS = {
 // needed run. Resize uses the same fit-fill technique as scene normalization — full content
 // preserved, no cropping, blurred fill instead of black bars.
 async function applyFinalAdjustments(inputPath, outputPath, opts) {
-  const { speed = 1, platformPreset = "none", resolution, brightness = 0, contrast = 1, saturation = 1 } = opts || {};
+  const { speed = 1, platformPreset = "none", resolution, brightness = 0, contrast = 1, saturation = 1, frameFitMode } = opts || {};
   const platform = PLATFORM_PRESETS[platformPreset] || PLATFORM_PRESETS.none;
   const target = platform.width && platform.height ? platform : (RESOLUTION_TIERS[resolution] || null);
   const speedClamped = Math.max(0.25, Math.min(4, Number(speed) || 1));
@@ -396,7 +416,7 @@ async function applyFinalAdjustments(inputPath, outputPath, opts) {
   if (target && target.width && target.height) {
     // Resize needed — build via filter_complex (fit-fill requires it), chaining any
     // color/speed filters onto the same output label.
-    let fc = fitFillFilter(target.width, target.height);
+    let fc = fitFillFilter(target.width, target.height, frameFitMode);
     if (simpleFilters.length) fc += `;[outv]${simpleFilters.join(",")}[outv2]`;
     const finalLabel = simpleFilters.length ? "[outv2]" : "[outv]";
     args.push("-filter_complex", fc, "-map", finalLabel, "-map", "0:a?");
@@ -448,7 +468,7 @@ async function tick() {
   try {
     job.status = "processing";
     if (job.type === "scene_generate") {
-      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, sfxFile } = job.payload;
+      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, captionFontColor, captionBgColor, frameFitMode, sfxFile } = job.payload;
       const audioPath = path.join(OUTPUT_DIR, `${sceneId}-voice.mp3`);
       const audioMixedPath = path.join(OUTPUT_DIR, `${sceneId}-voice-mixed.mp3`);
       const videoPath = path.join(OUTPUT_DIR, `${sceneId}-visual.mp4`);
@@ -462,20 +482,20 @@ async function tick() {
       }
       job.progress = 40;
       if (visualFiles && visualFiles.length > 0) {
-        await prepareUploadedVisual(visualFiles, finalAudioPath, videoPath);
+        await prepareUploadedVisual(visualFiles, finalAudioPath, videoPath, frameFitMode);
       } else {
         const targetDuration = await ffprobeDuration(finalAudioPath);
-        await generateVisual(imagePrompt, videoPath, targetDuration);
+        await generateVisual(imagePrompt, videoPath, targetDuration, frameFitMode);
       }
       job.progress = 75;
-      await mergeSceneAV(videoPath, finalAudioPath, mergedPath, showCaptions ? narration : null, captionSize);
+      await mergeSceneAV(videoPath, finalAudioPath, mergedPath, showCaptions ? narration : null, captionSize, captionFontColor, captionBgColor);
       job.progress = 100;
       job.resultUrl = `/files/${path.basename(mergedPath)}`;
       job.status = "complete";
     } else if (job.type === "final_export") {
       const {
         sceneFiles, musicFile, musicVolume,
-        speed, platformPreset, resolution, brightness, contrast, saturation,
+        speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode,
         exportFormat,
       } = job.payload; // sceneFiles: filenames already in OUTPUT_DIR
       const concatPath = path.join(OUTPUT_DIR, `concat-${job.id}.mp4`);
@@ -496,7 +516,7 @@ async function tick() {
       }
       job.progress = 55;
 
-      await applyFinalAdjustments(postMusicPath, adjustedPath, { speed, platformPreset, resolution, brightness, contrast, saturation });
+      await applyFinalAdjustments(postMusicPath, adjustedPath, { speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode });
       fs.unlinkSync(postMusicPath);
       job.progress = 80;
 
@@ -607,12 +627,12 @@ app.post("/uploads", upload.single("file"), (req, res) => {
 });
 
 app.post("/jobs/generate-scene", (req, res) => {
-  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, sfxFile } = req.body || {};
+  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, captionFontColor, captionBgColor, frameFitMode, sfxFile } = req.body || {};
   const hasVisualFiles = Array.isArray(visualFiles) && visualFiles.length > 0;
   if (!sceneId || !narration || !(imagePrompt || hasVisualFiles)) {
     return res.status(400).json({ error: "sceneId, narration, and either imagePrompt (for AI generation) or visualFiles (for manual uploads) are required" });
   }
-  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, sfxFile });
+  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, captionFontColor, captionBgColor, frameFitMode, sfxFile });
   res.json({ jobId: id });
 });
 
@@ -622,13 +642,13 @@ app.get("/platform-presets", (req, res) => {
 });
 
 app.post("/jobs/export", (req, res) => {
-  const { sceneFiles, musicFile, musicVolume, speed, platformPreset, resolution, brightness, contrast, saturation, exportFormat } = req.body || {};
+  const { sceneFiles, musicFile, musicVolume, speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode, exportFormat } = req.body || {};
   if (!Array.isArray(sceneFiles) || sceneFiles.length === 0) {
     return res.status(400).json({ error: "sceneFiles must be a non-empty array of filenames from prior scene_generate jobs" });
   }
   const id = createJob("final_export", {
     sceneFiles, musicFile, musicVolume,
-    speed, platformPreset, resolution, brightness, contrast, saturation,
+    speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode,
     exportFormat,
   });
   res.json({ jobId: id });
