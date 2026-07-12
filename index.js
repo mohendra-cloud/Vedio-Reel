@@ -8,6 +8,7 @@ import path from "path";
 import RunwayML from "@runwayml/sdk";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import multer from "multer";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
@@ -15,11 +16,53 @@ const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const RUNWAY_KEY = process.env.RUNWAYML_API_SECRET;
 const ACCESS_TOKEN = process.env.BACKEND_ACCESS_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "reelforge";
 
 const OUTPUT_DIR = path.resolve("./outputs");
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
 const runway = RUNWAY_KEY ? new RunwayML({ apiKey: RUNWAY_KEY }) : null;
+
+// --- optional persistent storage: local disk is fast for ffmpeg processing but wiped on every
+// Railway redeploy. When Supabase is configured, every uploaded file and every finished render
+// also gets a copy in Supabase Storage, and anything missing locally (because of a redeploy) is
+// pulled back down automatically before it's needed. Without Supabase configured, everything
+// still works exactly as before — just not redeploy-proof. ---
+const supabase = SUPABASE_URL && SUPABASE_SERVICE_KEY ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY) : null;
+if (supabase) {
+  console.log(`✓ Persistent storage enabled (Supabase bucket: ${SUPABASE_BUCKET})`);
+} else {
+  console.log("… Persistent storage not configured (SUPABASE_URL/SUPABASE_SERVICE_KEY not set) — files won't survive a redeploy.");
+}
+
+// Uploads a local file to Supabase Storage under the same filename. Best-effort: logs a
+// warning and continues on failure rather than breaking the actual render job over it.
+async function persistToStorage(localPath) {
+  if (!supabase) return;
+  try {
+    const filename = path.basename(localPath);
+    const buf = fs.readFileSync(localPath);
+    const { error } = await supabase.storage.from(SUPABASE_BUCKET).upload(filename, buf, { upsert: true });
+    if (error) console.error(`Supabase upload warning for ${filename}: ${error.message}`);
+  } catch (e) {
+    console.error(`Supabase upload warning: ${e.message}`);
+  }
+}
+
+// Pulls a file down from Supabase Storage into OUTPUT_DIR if it isn't already there locally —
+// this is what makes an upload or a previously-rendered scene survive a Railway redeploy.
+async function ensureLocalFile(filename) {
+  const localPath = path.join(OUTPUT_DIR, filename);
+  if (fs.existsSync(localPath)) return localPath;
+  if (!supabase) throw new Error(`File not found: ${filename} (and no persistent storage configured to recover it)`);
+  const { data, error } = await supabase.storage.from(SUPABASE_BUCKET).download(filename);
+  if (error || !data) throw new Error(`File not found locally and could not be recovered from storage: ${filename}${error ? " — " + error.message : ""}`);
+  const buf = Buffer.from(await data.arrayBuffer());
+  fs.writeFileSync(localPath, buf);
+  return localPath;
+}
 
 const uploadStorage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, OUTPUT_DIR),
@@ -81,12 +124,22 @@ async function generateVoice(text, voiceOptions, outPath) {
 const FRAME_W = 1280;
 const FRAME_H = 720;
 const FRAME_RATE = 25;
-// Fills the target frame completely (cropping any overflow) rather than padding with black
-// bars — matches how Instagram/TikTok/YouTube handle mismatched source aspect ratios. This
-// also matters because the export step resizes again for platform presets; padding at BOTH
-// stages compounds into a small, boxed-in video with black bars on every side (confirmed by
-// reproducing it directly from a real user report before this fix).
-const SCALE_PAD = `scale=${FRAME_W}:${FRAME_H}:force_original_aspect_ratio=increase,crop=${FRAME_W}:${FRAME_H},setsar=1`;
+
+// Fits the FULL source into the target frame (nothing cropped, nothing cut off) and fills
+// whatever empty space is left with a blurred, zoomed copy of the same image — the same
+// technique Instagram/TikTok/CapCut use when converting between aspect ratios. This replaced
+// two earlier attempts: plain padding (solid black bars, and compounded into a small boxed-in
+// video when applied at both the per-scene and export resize stages) and plain cropping
+// (fixed the black bars, but cut off real content — including the edges of burned-in
+// captions — whenever the source aspect ratio didn't match the target).
+function fitFillFilter(w, h, inLabel = "0:v", outLabel = "outv") {
+  return (
+    `[${inLabel}]split=2[bg][fg];` +
+    `[bg]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},gblur=sigma=25[bgb];` +
+    `[fg]scale=${w}:${h}:force_original_aspect_ratio=decrease[fgs];` +
+    `[bgb][fgs]overlay=(W-w)/2:(H-h)/2,setsar=1[${outLabel}]`
+  );
+}
 
 // Loops (if the source is shorter) or trims (if longer) a video to an exact target duration,
 // while normalizing it to the common frame size — used for both Runway output and uploaded
@@ -99,7 +152,8 @@ const SCALE_PAD = `scale=${FRAME_W}:${FRAME_H}:force_original_aspect_ratio=incre
 async function normalizeVideoToDuration(srcPath, outPath, targetDuration) {
   await ffmpeg([
     "-stream_loop", "-1", "-i", srcPath,
-    "-vf", `${SCALE_PAD},format=yuv420p`,
+    "-filter_complex", `${fitFillFilter(FRAME_W, FRAME_H)};[outv]format=yuv420p[outv2]`,
+    "-map", "[outv2]",
     "-t", String(targetDuration),
     "-r", String(FRAME_RATE),
     "-c:v", "libx264",
@@ -175,7 +229,8 @@ async function prepareUploadedVisual(filenames, audioPath, outPath) {
       const frames = Math.max(FRAME_RATE, Math.round(perClip * FRAME_RATE));
       await ffmpeg([
         "-loop", "1", "-i", srcPath,
-        "-vf", `${SCALE_PAD},zoompan=z='min(zoom+0.0008,1.15)':d=${frames}:s=${FRAME_W}x${FRAME_H},format=yuv420p`,
+        "-filter_complex", `${fitFillFilter(FRAME_W, FRAME_H)};[outv]zoompan=z='min(zoom+0.0008,1.15)':d=${frames}:s=${FRAME_W}x${FRAME_H},format=yuv420p[outv2]`,
+        "-map", "[outv2]",
         "-t", String(perClip), "-r", String(FRAME_RATE),
         "-c:v", "libx264", "-preset", "veryfast",
         clipPath,
@@ -251,12 +306,14 @@ function wrapCaptionText(text, maxCharsPerLine = 42) {
 // package installer actually work on this platform" uncertainty. Renders both Devanagari
 // (Hindi, Sanskrit) and standard Latin text correctly, confirmed by direct rendering test.
 const CAPTION_FONT = path.join(process.cwd(), "fonts", "NotoSansDevanagari-Bold.ttf");
+const CAPTION_SIZES = { small: 20, medium: 26, large: 34 };
 
 // Merge one scene's video + narration audio into a single clip, audio trimmed/padded to video length.
 // If captionText is provided, burns it in as on-screen captions (requires a re-encode; otherwise a fast copy).
-async function mergeSceneAV(videoPath, audioPath, outPath, captionText) {
+async function mergeSceneAV(videoPath, audioPath, outPath, captionText, captionSize) {
   if (captionText && captionText.trim()) {
-    const drawtext = `drawtext=fontfile=${CAPTION_FONT}:text='${escapeDrawtext(wrapCaptionText(captionText.trim()))}':fontcolor=white:fontsize=26:line_spacing=6:box=1:boxcolor=black@0.55:boxborderw=12:x=(w-text_w)/2:y=h-th-36`;
+    const fontsize = CAPTION_SIZES[captionSize] || CAPTION_SIZES.medium;
+    const drawtext = `drawtext=fontfile=${CAPTION_FONT}:text='${escapeDrawtext(wrapCaptionText(captionText.trim()))}':fontcolor=white:fontsize=${fontsize}:line_spacing=6:box=1:boxcolor=black@0.55:boxborderw=12:x=(w-text_w)/2:y=h-th-36`;
     await ffmpeg([
       "-i", videoPath,
       "-i", audioPath,
@@ -353,22 +410,20 @@ const RESOLUTION_TIERS = {
 // One pass: resize (platform preset takes priority; otherwise the plain resolution tier),
 // adjust brightness/contrast/saturation, and change playback speed — video and audio
 // together so they stay in sync. Any combination can be a no-op; only the filters actually
-// needed run.
+// needed run. Resize uses the same fit-fill technique as scene normalization — full content
+// preserved, no cropping, blurred fill instead of black bars.
 async function applyFinalAdjustments(inputPath, outputPath, opts) {
   const { speed = 1, platformPreset = "none", resolution, brightness = 0, contrast = 1, saturation = 1 } = opts || {};
   const platform = PLATFORM_PRESETS[platformPreset] || PLATFORM_PRESETS.none;
   const target = platform.width && platform.height ? platform : (RESOLUTION_TIERS[resolution] || null);
   const speedClamped = Math.max(0.25, Math.min(4, Number(speed) || 1));
 
-  const videoFilters = [];
-  if (target && target.width && target.height) {
-    videoFilters.push(`scale=${target.width}:${target.height}:force_original_aspect_ratio=increase,crop=${target.width}:${target.height},setsar=1`);
-  }
+  const simpleFilters = [];
   if (brightness !== 0 || contrast !== 1 || saturation !== 1) {
-    videoFilters.push(`eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}`);
+    simpleFilters.push(`eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}`);
   }
   if (speedClamped !== 1) {
-    videoFilters.push(`setpts=${(1 / speedClamped).toFixed(6)}*PTS`);
+    simpleFilters.push(`setpts=${(1 / speedClamped).toFixed(6)}*PTS`);
   }
 
   const audioFilters = [];
@@ -381,7 +436,16 @@ async function applyFinalAdjustments(inputPath, outputPath, opts) {
   }
 
   const args = ["-i", inputPath];
-  if (videoFilters.length) args.push("-vf", videoFilters.join(","));
+  if (target && target.width && target.height) {
+    // Resize needed — build via filter_complex (fit-fill requires it), chaining any
+    // color/speed filters onto the same output label.
+    let fc = fitFillFilter(target.width, target.height);
+    if (simpleFilters.length) fc += `;[outv]${simpleFilters.join(",")}[outv2]`;
+    const finalLabel = simpleFilters.length ? "[outv2]" : "[outv]";
+    args.push("-filter_complex", fc, "-map", finalLabel, "-map", "0:a?");
+  } else if (simpleFilters.length) {
+    args.push("-vf", simpleFilters.join(","));
+  }
   if (audioFilters.length) args.push("-af", audioFilters.join(","));
   args.push("-r", String(FRAME_RATE), "-c:v", "libx264", "-preset", "veryfast", "-threads", "2", "-x264-params", "threads=2:lookahead-threads=1", "-c:a", "aac", "-movflags", "+faststart", outputPath);
   await ffmpeg(args);
@@ -427,7 +491,7 @@ async function tick() {
   try {
     job.status = "processing";
     if (job.type === "scene_generate") {
-      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, sfxFile } = job.payload;
+      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, sfxFile } = job.payload;
       const audioPath = path.join(OUTPUT_DIR, `${sceneId}-voice.mp3`);
       const audioMixedPath = path.join(OUTPUT_DIR, `${sceneId}-voice-mixed.mp3`);
       const videoPath = path.join(OUTPUT_DIR, `${sceneId}-visual.mp4`);
@@ -436,21 +500,24 @@ async function tick() {
       await generateVoice(narration, { voiceId, pitch: voicePitch, rate: voiceRate }, audioPath);
       let finalAudioPath = audioPath;
       if (sfxFile) {
+        await ensureLocalFile(sfxFile);
         await mixSceneSfx(audioPath, sfxFile, audioMixedPath);
         finalAudioPath = audioMixedPath;
       }
       job.progress = 40;
       if (visualFiles && visualFiles.length > 0) {
+        await Promise.all(visualFiles.map((f) => ensureLocalFile(f)));
         await prepareUploadedVisual(visualFiles, finalAudioPath, videoPath);
       } else {
         const targetDuration = await ffprobeDuration(finalAudioPath);
         await generateVisual(imagePrompt, videoPath, targetDuration);
       }
       job.progress = 75;
-      await mergeSceneAV(videoPath, finalAudioPath, mergedPath, showCaptions ? narration : null);
+      await mergeSceneAV(videoPath, finalAudioPath, mergedPath, showCaptions ? narration : null, captionSize);
       job.progress = 100;
       job.resultUrl = `/files/${path.basename(mergedPath)}`;
       job.status = "complete";
+      persistToStorage(mergedPath); // fire-and-forget — don't block job completion on it
     } else if (job.type === "final_export") {
       const {
         sceneFiles, musicFile, musicVolume,
@@ -462,6 +529,7 @@ async function tick() {
       const adjustedPath = path.join(OUTPUT_DIR, `adjusted-${job.id}.mp4`);
       const finalExt = exportFormat === "GIF" ? "gif" : exportFormat === "WebM" ? "webm" : exportFormat === "MOV" ? "mov" : "mp4";
       const finalPath = path.join(OUTPUT_DIR, `export-${job.id}.${finalExt}`);
+      await Promise.all(sceneFiles.map((f) => ensureLocalFile(f)));
       const fullPaths = sceneFiles.map((f) => path.join(OUTPUT_DIR, f));
 
       await concatScenes(fullPaths, concatPath);
@@ -469,6 +537,7 @@ async function tick() {
 
       let postMusicPath = concatPath;
       if (musicFile) {
+        await ensureLocalFile(musicFile);
         await mixBackgroundMusic(concatPath, musicFile, musicedPath, musicVolume);
         fs.unlinkSync(concatPath);
         postMusicPath = musicedPath;
@@ -494,6 +563,7 @@ async function tick() {
       job.progress = 100;
       job.resultUrl = `/files/${path.basename(finalPath)}`;
       job.status = "complete";
+      persistToStorage(finalPath); // fire-and-forget
     }
   } catch (e) {
     job.status = "failed";
@@ -508,7 +578,16 @@ setInterval(tick, 1000);
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
-app.use("/files", express.static(OUTPUT_DIR));
+// Serves rendered files, recovering from Supabase Storage first if a redeploy wiped local
+// disk since this file was created. Falls through to a normal 404 if it's nowhere to be found.
+app.get("/files/:filename", async (req, res) => {
+  try {
+    const localPath = await ensureLocalFile(req.params.filename);
+    res.sendFile(localPath);
+  } catch (e) {
+    res.status(404).json({ error: "not found" });
+  }
+});
 
 // Public — no token needed, so uptime checks and a quick browser visit both work.
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -580,18 +659,19 @@ app.post("/ai/generate", async (req, res) => {
 
 // Manual video path: upload your own image or video for a scene instead of paying for Runway.
 // Returns a filename to include in the visualFiles array in /jobs/generate-scene.
-app.post("/uploads", upload.single("file"), (req, res) => {
+app.post("/uploads", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "file is required (multipart field name: file)" });
+  await persistToStorage(req.file.path);
   res.json({ filename: req.file.filename });
 });
 
 app.post("/jobs/generate-scene", (req, res) => {
-  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, sfxFile } = req.body || {};
+  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, sfxFile } = req.body || {};
   const hasVisualFiles = Array.isArray(visualFiles) && visualFiles.length > 0;
   if (!sceneId || !narration || !(imagePrompt || hasVisualFiles)) {
     return res.status(400).json({ error: "sceneId, narration, and either imagePrompt (for AI generation) or visualFiles (for manual uploads) are required" });
   }
-  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, sfxFile });
+  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, sfxFile });
   res.json({ jobId: id });
 });
 
