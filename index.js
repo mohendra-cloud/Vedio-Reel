@@ -8,7 +8,6 @@ import path from "path";
 import RunwayML from "@runwayml/sdk";
 import { MsEdgeTTS, OUTPUT_FORMAT } from "msedge-tts";
 import multer from "multer";
-import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
@@ -16,53 +15,11 @@ const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const RUNWAY_KEY = process.env.RUNWAYML_API_SECRET;
 const ACCESS_TOKEN = process.env.BACKEND_ACCESS_TOKEN;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const SUPABASE_BUCKET = process.env.SUPABASE_BUCKET || "reelforge";
 
 const OUTPUT_DIR = path.resolve("./outputs");
 fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 
 const runway = RUNWAY_KEY ? new RunwayML({ apiKey: RUNWAY_KEY }) : null;
-
-// --- optional persistent storage: local disk is fast for ffmpeg processing but wiped on every
-// Railway redeploy. When Supabase is configured, every uploaded file and every finished render
-// also gets a copy in Supabase Storage, and anything missing locally (because of a redeploy) is
-// pulled back down automatically before it's needed. Without Supabase configured, everything
-// still works exactly as before — just not redeploy-proof. ---
-const supabase = SUPABASE_URL && SUPABASE_SERVICE_KEY ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY) : null;
-if (supabase) {
-  console.log(`✓ Persistent storage enabled (Supabase bucket: ${SUPABASE_BUCKET})`);
-} else {
-  console.log("… Persistent storage not configured (SUPABASE_URL/SUPABASE_SERVICE_KEY not set) — files won't survive a redeploy.");
-}
-
-// Uploads a local file to Supabase Storage under the same filename. Best-effort: logs a
-// warning and continues on failure rather than breaking the actual render job over it.
-async function persistToStorage(localPath) {
-  if (!supabase) return;
-  try {
-    const filename = path.basename(localPath);
-    const buf = fs.readFileSync(localPath);
-    const { error } = await supabase.storage.from(SUPABASE_BUCKET).upload(filename, buf, { upsert: true });
-    if (error) console.error(`Supabase upload warning for ${filename}: ${error.message}`);
-  } catch (e) {
-    console.error(`Supabase upload warning: ${e.message}`);
-  }
-}
-
-// Pulls a file down from Supabase Storage into OUTPUT_DIR if it isn't already there locally —
-// this is what makes an upload or a previously-rendered scene survive a Railway redeploy.
-async function ensureLocalFile(filename) {
-  const localPath = path.join(OUTPUT_DIR, filename);
-  if (fs.existsSync(localPath)) return localPath;
-  if (!supabase) throw new Error(`File not found: ${filename} (and no persistent storage configured to recover it)`);
-  const { data, error } = await supabase.storage.from(SUPABASE_BUCKET).download(filename);
-  if (error || !data) throw new Error(`File not found locally and could not be recovered from storage: ${filename}${error ? " — " + error.message : ""}`);
-  const buf = Buffer.from(await data.arrayBuffer());
-  fs.writeFileSync(localPath, buf);
-  return localPath;
-}
 
 const uploadStorage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, OUTPUT_DIR),
@@ -500,13 +457,11 @@ async function tick() {
       await generateVoice(narration, { voiceId, pitch: voicePitch, rate: voiceRate }, audioPath);
       let finalAudioPath = audioPath;
       if (sfxFile) {
-        await ensureLocalFile(sfxFile);
         await mixSceneSfx(audioPath, sfxFile, audioMixedPath);
         finalAudioPath = audioMixedPath;
       }
       job.progress = 40;
       if (visualFiles && visualFiles.length > 0) {
-        await Promise.all(visualFiles.map((f) => ensureLocalFile(f)));
         await prepareUploadedVisual(visualFiles, finalAudioPath, videoPath);
       } else {
         const targetDuration = await ffprobeDuration(finalAudioPath);
@@ -517,7 +472,6 @@ async function tick() {
       job.progress = 100;
       job.resultUrl = `/files/${path.basename(mergedPath)}`;
       job.status = "complete";
-      persistToStorage(mergedPath); // fire-and-forget — don't block job completion on it
     } else if (job.type === "final_export") {
       const {
         sceneFiles, musicFile, musicVolume,
@@ -529,7 +483,6 @@ async function tick() {
       const adjustedPath = path.join(OUTPUT_DIR, `adjusted-${job.id}.mp4`);
       const finalExt = exportFormat === "GIF" ? "gif" : exportFormat === "WebM" ? "webm" : exportFormat === "MOV" ? "mov" : "mp4";
       const finalPath = path.join(OUTPUT_DIR, `export-${job.id}.${finalExt}`);
-      await Promise.all(sceneFiles.map((f) => ensureLocalFile(f)));
       const fullPaths = sceneFiles.map((f) => path.join(OUTPUT_DIR, f));
 
       await concatScenes(fullPaths, concatPath);
@@ -537,7 +490,6 @@ async function tick() {
 
       let postMusicPath = concatPath;
       if (musicFile) {
-        await ensureLocalFile(musicFile);
         await mixBackgroundMusic(concatPath, musicFile, musicedPath, musicVolume);
         fs.unlinkSync(concatPath);
         postMusicPath = musicedPath;
@@ -563,7 +515,6 @@ async function tick() {
       job.progress = 100;
       job.resultUrl = `/files/${path.basename(finalPath)}`;
       job.status = "complete";
-      persistToStorage(finalPath); // fire-and-forget
     }
   } catch (e) {
     job.status = "failed";
@@ -578,16 +529,7 @@ setInterval(tick, 1000);
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
-// Serves rendered files, recovering from Supabase Storage first if a redeploy wiped local
-// disk since this file was created. Falls through to a normal 404 if it's nowhere to be found.
-app.get("/files/:filename", async (req, res) => {
-  try {
-    const localPath = await ensureLocalFile(req.params.filename);
-    res.sendFile(localPath);
-  } catch (e) {
-    res.status(404).json({ error: "not found" });
-  }
-});
+app.use("/files", express.static(OUTPUT_DIR));
 
 // Public — no token needed, so uptime checks and a quick browser visit both work.
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -659,9 +601,8 @@ app.post("/ai/generate", async (req, res) => {
 
 // Manual video path: upload your own image or video for a scene instead of paying for Runway.
 // Returns a filename to include in the visualFiles array in /jobs/generate-scene.
-app.post("/uploads", upload.single("file"), async (req, res) => {
+app.post("/uploads", upload.single("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "file is required (multipart field name: file)" });
-  await persistToStorage(req.file.path);
   res.json({ filename: req.file.filename });
 });
 
