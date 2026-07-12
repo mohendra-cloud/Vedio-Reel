@@ -325,6 +325,8 @@ async function burnCaptionsWithTiming(inputPath, outputPath, segments, captionSi
     "-vf", filters.join(","),
     "-c:v", "libx264",
     "-preset", "veryfast",
+    "-threads", "2",
+    "-x264-params", "threads=2:lookahead-threads=1",
     "-c:a", "copy",
     "-movflags", "+faststart",
     outputPath,
