@@ -283,36 +283,52 @@ function toFFmpegColor(hex, fallback) {
   return fallback;
 }
 
-// Merge one scene's video + narration audio into a single clip, audio trimmed/padded to video length.
-// If captionText is provided, burns it in as on-screen captions (requires a re-encode; otherwise a fast copy).
-async function mergeSceneAV(videoPath, audioPath, outPath, captionText, captionSize, captionFontColor, captionBgColor) {
-  if (captionText && captionText.trim()) {
-    const fontsize = CAPTION_SIZES[captionSize] || CAPTION_SIZES.medium;
-    const fontColor = toFFmpegColor(captionFontColor, "white");
-    const boxColor = toFFmpegColor(captionBgColor, "black") + "@0.55";
-    const drawtext = `drawtext=fontfile=${CAPTION_FONT}:text='${escapeDrawtext(wrapCaptionText(captionText.trim()))}':fontcolor=${fontColor}:fontsize=${fontsize}:line_spacing=6:box=1:boxcolor=${boxColor}:boxborderw=12:x=(w-text_w)/2:y=h-th-36`;
-    await ffmpeg([
-      "-i", videoPath,
-      "-i", audioPath,
-      "-vf", drawtext,
-      "-c:v", "libx264",
-      "-preset", "veryfast",
-      "-c:a", "aac",
-      "-shortest",
-      "-movflags", "+faststart",
-      outPath,
-    ]);
-  } else {
-    await ffmpeg([
-      "-i", videoPath,
-      "-i", audioPath,
-      "-c:v", "copy",
-      "-c:a", "aac",
-      "-shortest",
-      "-movflags", "+faststart",
-      outPath,
-    ]);
+// Merge one scene's video + narration audio into a single clip, audio trimmed/padded to
+// video length. Captions are NOT burned in here anymore — they're burned in once, at export
+// time, after the final resize — because burning them at this stage positions them relative
+// to the intermediate 1280x720 scene frame, which lands them off-center (often mid-frame
+// instead of at the bottom) once that scene gets resized into a different final aspect ratio.
+async function mergeSceneAV(videoPath, audioPath, outPath) {
+  await ffmpeg([
+    "-i", videoPath,
+    "-i", audioPath,
+    "-c:v", "copy",
+    "-c:a", "aac",
+    "-shortest",
+    "-movflags", "+faststart",
+    outPath,
+  ]);
+}
+
+// Burns captions onto the FINAL, already-resized video — one drawtext filter per scene, each
+// scoped to only show during that scene's own time window via ffmpeg's enable=between(t,..)
+// mechanism. This is what fixes captions landing off-center: by running after the final
+// resize (not before it, at the per-scene stage), "bottom of frame" always means the bottom
+// of the frame you're actually watching, whatever its final shape.
+//
+// segments: [{ text, start, end }] — start/end in seconds, already adjusted for any speed change.
+async function burnCaptionsWithTiming(inputPath, outputPath, segments, captionSize, captionFontColor, captionBgColor) {
+  const usable = segments.filter((s) => s.text && s.text.trim());
+  if (usable.length === 0) {
+    fs.copyFileSync(inputPath, outputPath);
+    return;
   }
+  const fontsize = CAPTION_SIZES[captionSize] || CAPTION_SIZES.medium;
+  const fontColor = toFFmpegColor(captionFontColor, "white");
+  const boxColor = toFFmpegColor(captionBgColor, "black") + "@0.55";
+  const filters = usable.map((s) => {
+    const text = escapeDrawtext(wrapCaptionText(s.text.trim()));
+    return `drawtext=fontfile=${CAPTION_FONT}:text='${text}':fontcolor=${fontColor}:fontsize=${fontsize}:line_spacing=6:box=1:boxcolor=${boxColor}:boxborderw=12:x=(w-text_w)/2:y=h-th-36:enable='between(t,${s.start.toFixed(3)},${s.end.toFixed(3)})'`;
+  });
+  await ffmpeg([
+    "-i", inputPath,
+    "-vf", filters.join(","),
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-c:a", "copy",
+    "-movflags", "+faststart",
+    outputPath,
+  ]);
 }
 
 // Concatenate merged scene clips into the final export.
@@ -468,7 +484,7 @@ async function tick() {
   try {
     job.status = "processing";
     if (job.type === "scene_generate") {
-      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, captionFontColor, captionBgColor, frameFitMode, sfxFile } = job.payload;
+      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, frameFitMode, sfxFile } = job.payload;
       const audioPath = path.join(OUTPUT_DIR, `${sceneId}-voice.mp3`);
       const audioMixedPath = path.join(OUTPUT_DIR, `${sceneId}-voice-mixed.mp3`);
       const videoPath = path.join(OUTPUT_DIR, `${sceneId}-visual.mp4`);
@@ -488,25 +504,37 @@ async function tick() {
         await generateVisual(imagePrompt, videoPath, targetDuration, frameFitMode);
       }
       job.progress = 75;
-      await mergeSceneAV(videoPath, finalAudioPath, mergedPath, showCaptions ? narration : null, captionSize, captionFontColor, captionBgColor);
+      await mergeSceneAV(videoPath, finalAudioPath, mergedPath);
       job.progress = 100;
       job.resultUrl = `/files/${path.basename(mergedPath)}`;
       job.status = "complete";
     } else if (job.type === "final_export") {
       const {
-        sceneFiles, musicFile, musicVolume,
+        sceneFiles, captionTexts, musicFile, musicVolume,
         speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode,
+        showCaptions, captionSize, captionFontColor, captionBgColor,
         exportFormat,
       } = job.payload; // sceneFiles: filenames already in OUTPUT_DIR
       const concatPath = path.join(OUTPUT_DIR, `concat-${job.id}.mp4`);
       const musicedPath = path.join(OUTPUT_DIR, `music-${job.id}.mp4`);
       const adjustedPath = path.join(OUTPUT_DIR, `adjusted-${job.id}.mp4`);
+      const captionedPath = path.join(OUTPUT_DIR, `captioned-${job.id}.mp4`);
       const finalExt = exportFormat === "GIF" ? "gif" : exportFormat === "WebM" ? "webm" : exportFormat === "MOV" ? "mov" : "mp4";
       const finalPath = path.join(OUTPUT_DIR, `export-${job.id}.${finalExt}`);
       const fullPaths = sceneFiles.map((f) => path.join(OUTPUT_DIR, f));
 
+      // Work out each scene's time window in the final timeline BEFORE concatenating, so
+      // captions can be scoped to the right scene once burned in later.
+      let cumulative = 0;
+      const rawSegments = [];
+      for (let i = 0; i < fullPaths.length; i++) {
+        const dur = await ffprobeDuration(fullPaths[i]);
+        rawSegments.push({ text: (captionTexts && captionTexts[i]) || "", start: cumulative, end: cumulative + dur });
+        cumulative += dur;
+      }
+
       await concatScenes(fullPaths, concatPath);
-      job.progress = 35;
+      job.progress = 30;
 
       let postMusicPath = concatPath;
       if (musicFile) {
@@ -514,22 +542,34 @@ async function tick() {
         fs.unlinkSync(concatPath);
         postMusicPath = musicedPath;
       }
-      job.progress = 55;
+      job.progress = 50;
 
       await applyFinalAdjustments(postMusicPath, adjustedPath, { speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode });
       fs.unlinkSync(postMusicPath);
+      job.progress = 70;
+
+      // Burn captions now, on the truly final-shaped frame, with timing adjusted for any
+      // speed change (matches the same clamping applyFinalAdjustments used internally).
+      let postCaptionPath = adjustedPath;
+      if (showCaptions && rawSegments.some((s) => s.text.trim())) {
+        const speedClamped = Math.max(0.25, Math.min(4, Number(speed) || 1));
+        const timedSegments = rawSegments.map((s) => ({ text: s.text, start: s.start / speedClamped, end: s.end / speedClamped }));
+        await burnCaptionsWithTiming(adjustedPath, captionedPath, timedSegments, captionSize, captionFontColor, captionBgColor);
+        fs.unlinkSync(adjustedPath);
+        postCaptionPath = captionedPath;
+      }
       job.progress = 80;
 
       if (exportFormat === "GIF") {
-        await convertToGif(adjustedPath, finalPath);
-        fs.unlinkSync(adjustedPath);
+        await convertToGif(postCaptionPath, finalPath);
+        fs.unlinkSync(postCaptionPath);
       } else if (exportFormat === "WebM") {
-        await convertToWebm(adjustedPath, finalPath);
-        fs.unlinkSync(adjustedPath);
+        await convertToWebm(postCaptionPath, finalPath);
+        fs.unlinkSync(postCaptionPath);
       } else if (exportFormat === "MOV") {
-        fs.renameSync(adjustedPath, finalPath); // MOV can hold the same h264/aac stream as-is
+        fs.renameSync(postCaptionPath, finalPath); // MOV can hold the same h264/aac stream as-is
       } else {
-        fs.renameSync(adjustedPath, finalPath);
+        fs.renameSync(postCaptionPath, finalPath);
       }
 
       job.progress = 100;
@@ -627,12 +667,12 @@ app.post("/uploads", upload.single("file"), (req, res) => {
 });
 
 app.post("/jobs/generate-scene", (req, res) => {
-  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, captionFontColor, captionBgColor, frameFitMode, sfxFile } = req.body || {};
+  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, frameFitMode, sfxFile } = req.body || {};
   const hasVisualFiles = Array.isArray(visualFiles) && visualFiles.length > 0;
   if (!sceneId || !narration || !(imagePrompt || hasVisualFiles)) {
     return res.status(400).json({ error: "sceneId, narration, and either imagePrompt (for AI generation) or visualFiles (for manual uploads) are required" });
   }
-  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, showCaptions, captionSize, captionFontColor, captionBgColor, frameFitMode, sfxFile });
+  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, frameFitMode, sfxFile });
   res.json({ jobId: id });
 });
 
@@ -642,13 +682,19 @@ app.get("/platform-presets", (req, res) => {
 });
 
 app.post("/jobs/export", (req, res) => {
-  const { sceneFiles, musicFile, musicVolume, speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode, exportFormat } = req.body || {};
+  const {
+    sceneFiles, captionTexts, musicFile, musicVolume,
+    speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode,
+    showCaptions, captionSize, captionFontColor, captionBgColor,
+    exportFormat,
+  } = req.body || {};
   if (!Array.isArray(sceneFiles) || sceneFiles.length === 0) {
     return res.status(400).json({ error: "sceneFiles must be a non-empty array of filenames from prior scene_generate jobs" });
   }
   const id = createJob("final_export", {
-    sceneFiles, musicFile, musicVolume,
+    sceneFiles, captionTexts, musicFile, musicVolume,
     speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode,
+    showCaptions, captionSize, captionFontColor, captionBgColor,
     exportFormat,
   });
   res.json({ jobId: id });
