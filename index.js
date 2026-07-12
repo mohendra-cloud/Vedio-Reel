@@ -81,7 +81,12 @@ async function generateVoice(text, voiceOptions, outPath) {
 const FRAME_W = 1280;
 const FRAME_H = 720;
 const FRAME_RATE = 25;
-const SCALE_PAD = `scale=${FRAME_W}:${FRAME_H}:force_original_aspect_ratio=decrease,pad=${FRAME_W}:${FRAME_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`;
+// Fills the target frame completely (cropping any overflow) rather than padding with black
+// bars — matches how Instagram/TikTok/YouTube handle mismatched source aspect ratios. This
+// also matters because the export step resizes again for platform presets; padding at BOTH
+// stages compounds into a small, boxed-in video with black bars on every side (confirmed by
+// reproducing it directly from a real user report before this fix).
+const SCALE_PAD = `scale=${FRAME_W}:${FRAME_H}:force_original_aspect_ratio=increase,crop=${FRAME_W}:${FRAME_H},setsar=1`;
 
 // Loops (if the source is shorter) or trims (if longer) a video to an exact target duration,
 // while normalizing it to the common frame size — used for both Runway output and uploaded
@@ -241,7 +246,11 @@ function wrapCaptionText(text, maxCharsPerLine = 42) {
 // and standard Latin text correctly in the same font, confirmed by direct testing. DejaVu Sans
 // (the previous font) has no Devanagari glyphs at all, which produced garbled boxes instead of
 // text for any Hindi/Sanskrit captions.
-const CAPTION_FONT = "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Bold.ttf";
+// Bundled directly in the repo (fonts/NotoSansDevanagari-Bold.ttf) rather than relying on
+// an apt-get install succeeding at deploy time — this removes an entire class of "did the
+// package installer actually work on this platform" uncertainty. Renders both Devanagari
+// (Hindi, Sanskrit) and standard Latin text correctly, confirmed by direct rendering test.
+const CAPTION_FONT = path.join(process.cwd(), "fonts", "NotoSansDevanagari-Bold.ttf");
 
 // Merge one scene's video + narration audio into a single clip, audio trimmed/padded to video length.
 // If captionText is provided, burns it in as on-screen captions (requires a re-encode; otherwise a fast copy).
@@ -353,7 +362,7 @@ async function applyFinalAdjustments(inputPath, outputPath, opts) {
 
   const videoFilters = [];
   if (target && target.width && target.height) {
-    videoFilters.push(`scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease,pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1`);
+    videoFilters.push(`scale=${target.width}:${target.height}:force_original_aspect_ratio=increase,crop=${target.width}:${target.height},setsar=1`);
   }
   if (brightness !== 0 || contrast !== 1 || saturation !== 1) {
     videoFilters.push(`eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}`);
@@ -609,5 +618,11 @@ app.get("/jobs/:id", (req, res) => {
   if (!job) return res.status(404).json({ error: "not found" });
   res.json(job);
 });
+
+if (fs.existsSync(CAPTION_FONT)) {
+  console.log(`✓ Caption font found: ${CAPTION_FONT}`);
+} else {
+  console.error(`✗ WARNING: Caption font NOT FOUND at ${CAPTION_FONT} — Hindi/Sanskrit/English captions will fail or render incorrectly. Check that the fonts/ folder was actually pushed to the repo.`);
+}
 
 app.listen(PORT, () => console.log(`ReelForge backend listening on :${PORT}`));
