@@ -162,6 +162,28 @@ function ffprobeDuration(filePath) {
   });
 }
 
+// Reads the actual real width/height of a video file — used to size caption text and margins
+// correctly for whatever the true final frame turned out to be, rather than recomputing (and
+// risking drift from) the resize logic elsewhere.
+function ffprobeDimensions(filePath) {
+  return new Promise((resolve) => {
+    const proc = spawn("ffprobe", [
+      "-v", "error",
+      "-select_streams", "v:0",
+      "-show_entries", "stream=width,height",
+      "-of", "csv=s=x:p=0",
+      filePath,
+    ]);
+    let out = "";
+    proc.stdout.on("data", (d) => (out += d.toString()));
+    proc.on("close", () => {
+      const match = out.trim().match(/^(\d+)x(\d+)$/);
+      resolve(match ? { width: parseInt(match[1], 10), height: parseInt(match[2], 10) } : { width: FRAME_W, height: FRAME_H });
+    });
+    proc.on("error", () => resolve({ width: FRAME_W, height: FRAME_H }));
+  });
+}
+
 const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".webm", ".m4v", ".avi"]);
 
 // Turns manually uploaded images/videos into a single clip matching the narration's length —
@@ -307,7 +329,31 @@ async function mergeSceneAV(videoPath, audioPath, outPath) {
 // of the frame you're actually watching, whatever its final shape.
 //
 // segments: [{ text, start, end }] — start/end in seconds, already adjusted for any speed change.
-async function burnCaptionsWithTiming(inputPath, outputPath, segments, captionSize, captionFontColor, captionBgColor) {
+// frameWidth/frameHeight: the actual final output dimensions, so line-wrapping and margins
+// scale correctly whether the video ends up wide, narrow, or square — instead of wrapping at
+// a fixed character count regardless of how much horizontal room is actually available.
+// Formats seconds as an SRT timestamp: HH:MM:SS,mmm
+function srtTimestamp(totalSeconds) {
+  const ms = Math.round(totalSeconds * 1000);
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  const msRemainder = ms % 1000;
+  const pad = (n, len = 2) => String(n).padStart(len, "0");
+  return `${pad(h)}:${pad(m)}:${pad(s)},${pad(msRemainder, 3)}`;
+}
+
+// Builds a standard .srt subtitle file from the same timed segments used for burned-in
+// captions — so you always get a real, downloadable subtitle file that matches your video
+// exactly, whether or not you also chose to burn the captions into the video itself.
+function generateSrt(segments) {
+  const usable = segments.filter((s) => s.text && s.text.trim());
+  return usable
+    .map((s, i) => `${i + 1}\n${srtTimestamp(s.start)} --> ${srtTimestamp(s.end)}\n${s.text.trim()}\n`)
+    .join("\n");
+}
+
+async function burnCaptionsWithTiming(inputPath, outputPath, segments, captionSize, captionFontColor, captionBgColor, frameWidth, frameHeight) {
   const usable = segments.filter((s) => s.text && s.text.trim());
   if (usable.length === 0) {
     fs.copyFileSync(inputPath, outputPath);
@@ -316,9 +362,17 @@ async function burnCaptionsWithTiming(inputPath, outputPath, segments, captionSi
   const fontsize = CAPTION_SIZES[captionSize] || CAPTION_SIZES.medium;
   const fontColor = toFFmpegColor(captionFontColor, "white");
   const boxColor = toFFmpegColor(captionBgColor, "black") + "@0.55";
+  const w = frameWidth || FRAME_W;
+  const h = frameHeight || FRAME_H;
+  // Calibrated against the real font: measured ~0.44x fontsize per average Devanagari glyph
+  // width at render time; 0.5x adds a small safety margin so wrapped lines never overflow.
+  const marginPct = 0.08; // 8% margin on each side (left + right)
+  const usableWidth = w * (1 - marginPct * 2);
+  const maxCharsPerLine = Math.max(14, Math.floor(usableWidth / (fontsize * 0.5)));
+  const bottomMargin = Math.round(h * 0.04); // scales with frame height instead of a fixed pixel value
   const filters = usable.map((s) => {
-    const text = escapeDrawtext(wrapCaptionText(s.text.trim()));
-    return `drawtext=fontfile=${CAPTION_FONT}:text='${text}':fontcolor=${fontColor}:fontsize=${fontsize}:line_spacing=6:box=1:boxcolor=${boxColor}:boxborderw=12:x=(w-text_w)/2:y=h-th-36:enable='between(t,${s.start.toFixed(3)},${s.end.toFixed(3)})'`;
+    const text = escapeDrawtext(wrapCaptionText(s.text.trim(), maxCharsPerLine));
+    return `drawtext=fontfile=${CAPTION_FONT}:text='${text}':fontcolor=${fontColor}:fontsize=${fontsize}:line_spacing=6:box=1:boxcolor=${boxColor}:boxborderw=12:x=(w-text_w)/2:y=h-th-${bottomMargin}:enable='between(t,${s.start.toFixed(3)},${s.end.toFixed(3)})'`;
   });
   await ffmpeg([
     "-i", inputPath,
@@ -550,17 +604,33 @@ async function tick() {
       fs.unlinkSync(postMusicPath);
       job.progress = 70;
 
-      // Burn captions now, on the truly final-shaped frame, with timing adjusted for any
-      // speed change (matches the same clamping applyFinalAdjustments used internally).
+      // Timing adjusted for any speed change — shared by both burned-in captions and the
+      // standalone .srt file, so they always agree with each other and with the real video.
+      const speedClamped = Math.max(0.25, Math.min(4, Number(speed) || 1));
+      const timedSegments = rawSegments.map((s) => ({ text: s.text, start: s.start / speedClamped, end: s.end / speedClamped }));
+      const hasCaptionText = timedSegments.some((s) => s.text.trim());
+
+      // Burn captions now, on the truly final-shaped frame — running after the resize (not
+      // before it, at the per-scene stage) is what makes "bottom of frame" always mean the
+      // bottom of the frame you're actually watching, whatever its final shape.
       let postCaptionPath = adjustedPath;
-      if (showCaptions && rawSegments.some((s) => s.text.trim())) {
-        const speedClamped = Math.max(0.25, Math.min(4, Number(speed) || 1));
-        const timedSegments = rawSegments.map((s) => ({ text: s.text, start: s.start / speedClamped, end: s.end / speedClamped }));
-        await burnCaptionsWithTiming(adjustedPath, captionedPath, timedSegments, captionSize, captionFontColor, captionBgColor);
+      if (showCaptions && hasCaptionText) {
+        const { width: realWidth, height: realHeight } = await ffprobeDimensions(adjustedPath);
+        await burnCaptionsWithTiming(adjustedPath, captionedPath, timedSegments, captionSize, captionFontColor, captionBgColor, realWidth, realHeight);
         fs.unlinkSync(adjustedPath);
         postCaptionPath = captionedPath;
       }
       job.progress = 80;
+
+      // A standalone .srt file, generated whenever there's caption text at all — independent
+      // of whether you also chose to burn captions into the video. Useful for YouTube's native
+      // subtitle upload, which is more accessible/searchable than burned-in text alone.
+      let srtUrl = null;
+      if (hasCaptionText) {
+        const srtPath = path.join(OUTPUT_DIR, `export-${job.id}.srt`);
+        fs.writeFileSync(srtPath, generateSrt(timedSegments));
+        srtUrl = `/files/${path.basename(srtPath)}`;
+      }
 
       if (exportFormat === "GIF") {
         await convertToGif(postCaptionPath, finalPath);
@@ -576,6 +646,7 @@ async function tick() {
 
       job.progress = 100;
       job.resultUrl = `/files/${path.basename(finalPath)}`;
+      job.srtUrl = srtUrl;
       job.status = "complete";
     }
   } catch (e) {
