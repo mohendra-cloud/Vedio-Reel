@@ -267,15 +267,31 @@ async function prepareUploadedVisual(filenames, audioPath, outPath, frameFitMode
 async function generateText(prompt) {
   if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not set on the backend");
   const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent";
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-  });
-  if (!res.ok) throw new Error(`Gemini error ${res.status}: ${await res.text()}`);
-  const data = await res.json();
-  const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
-  return text;
+  const maxRetries = 3;
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
+    }
+    const errText = await res.text();
+    lastError = new Error(`Gemini error ${res.status}: ${errText}`);
+    // 503 (server overloaded) and 429 (rate limited) are genuinely worth retrying — they're
+    // temporary. A 400/401/403 means something's actually wrong (bad request, bad key), and
+    // retrying that would just fail the same way every time, so those throw immediately.
+    if ((res.status === 503 || res.status === 429) && attempt < maxRetries) {
+      const waitMs = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s between attempts
+      await new Promise((r) => setTimeout(r, waitMs));
+      continue;
+    }
+    throw lastError;
+  }
+  throw lastError;
 }
 
 function ffmpeg(args) {
