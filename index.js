@@ -267,7 +267,8 @@ async function prepareUploadedVisual(filenames, audioPath, outPath, frameFitMode
 async function generateText(prompt) {
   if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY is not set on the backend");
   const url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent";
-  const maxRetries = 3;
+  const maxRetries = 6;
+  const maxWaitMs = 10000; // cap backoff so retries don't compound into an unreasonably long wait
   let lastError;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const res = await fetch(url, {
@@ -285,9 +286,18 @@ async function generateText(prompt) {
     // temporary. A 400/401/403 means something's actually wrong (bad request, bad key), and
     // retrying that would just fail the same way every time, so those throw immediately.
     if ((res.status === 503 || res.status === 429) && attempt < maxRetries) {
-      const waitMs = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s between attempts
+      const waitMs = Math.min(1000 * Math.pow(2, attempt), maxWaitMs); // 1s,2s,4s,8s,10s,10s
       await new Promise((r) => setTimeout(r, waitMs));
       continue;
+    }
+    if (res.status === 503 || res.status === 429) {
+      // All retries exhausted — this is a known, widely-reported Google-side capacity issue
+      // (not specific to this account or key), so say so plainly rather than just surfacing
+      // the raw JSON error.
+      throw new Error(
+        `Gemini's servers are still overloaded after ${maxRetries + 1} attempts over about 35 seconds. ` +
+        `This is a known, widely-reported issue on Google's side during high-demand periods, not something wrong with your setup. Wait a minute or two and try again.`
+      );
     }
     throw lastError;
   }
