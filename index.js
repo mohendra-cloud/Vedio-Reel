@@ -59,6 +59,35 @@ function insertPoeticPauses(text, breakMs = 350) {
   return result;
 }
 
+// Splits one scene's narration into smaller pieces for progressive, line-by-line captions
+// instead of one static block for the whole scene. Prefers paragraph breaks if present,
+// otherwise falls back to sentence-ish boundaries (danda ।, double danda ॥, and standard
+// punctuation) — the same boundaries insertPoeticPauses already uses.
+function splitIntoCaptionChunks(text) {
+  const paraSplit = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  if (paraSplit.length > 1) return paraSplit;
+  const sentenceSplit = text.split(/(?<=[।॥.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+  return sentenceSplit.length > 0 ? sentenceSplit : [text.trim()];
+}
+
+// Gives each chunk a time slice within the scene's [sceneStart, sceneEnd] window, sized
+// proportionally to how much of the scene's text it contains — a reasonable approximation of
+// speech timing without needing true word-level audio alignment (which would need a speech
+// recognition/forced-alignment step we don't have). Longer sentences get proportionally more
+// time than short ones, rather than every chunk getting an identical, likely-wrong duration.
+function allocateChunkTimings(chunks, sceneStart, sceneEnd) {
+  const totalChars = chunks.reduce((sum, c) => sum + c.length, 0) || 1;
+  const sceneDuration = sceneEnd - sceneStart;
+  let cursor = sceneStart;
+  return chunks.map((chunk) => {
+    const share = chunk.length / totalChars;
+    const dur = sceneDuration * share;
+    const seg = { text: chunk, start: cursor, end: cursor + dur };
+    cursor += dur;
+    return seg;
+  });
+}
+
 // Wraps text in <mstts:express-as>, Azure's SSML tag for speaking styles (cheerful, empathetic,
 // etc). IMPORTANT HONESTY NOTE: this is a real Azure Speech feature, confirmed to exist for
 // hi-IN-SwaraNeural specifically (styles: cheerful, empathetic, newscast) — but our TTS client
@@ -657,13 +686,19 @@ async function tick() {
       const finalPath = path.join(OUTPUT_DIR, `export-${job.id}.${finalExt}`);
       const fullPaths = sceneFiles.map((f) => path.join(OUTPUT_DIR, f));
 
-      // Work out each scene's time window in the final timeline BEFORE concatenating, so
-      // captions can be scoped to the right scene once burned in later.
+      // Work out each scene's time window in the final timeline BEFORE concatenating, then
+      // split that scene's narration into smaller chunks (paragraphs, or sentences if there
+      // are no paragraph breaks) so captions appear and disappear progressively through the
+      // scene instead of showing the whole block the entire time.
       let cumulative = 0;
       const rawSegments = [];
       for (let i = 0; i < fullPaths.length; i++) {
         const dur = await ffprobeDuration(fullPaths[i]);
-        rawSegments.push({ text: (captionTexts && captionTexts[i]) || "", start: cumulative, end: cumulative + dur });
+        const sceneText = (captionTexts && captionTexts[i]) || "";
+        if (sceneText.trim()) {
+          const chunks = splitIntoCaptionChunks(sceneText);
+          rawSegments.push(...allocateChunkTimings(chunks, cumulative, cumulative + dur));
+        }
         cumulative += dur;
       }
 
