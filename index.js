@@ -44,6 +44,33 @@ function createJob(type, payload) {
 // --- free, server-side voice via Microsoft Edge's neural voices (no API key, no per-character cost) ---
 const DEFAULT_VOICE_ID = "en-US-AriaNeural";
 
+// Inserts SSML <break> pauses at natural line/sentence boundaries — the danda (।) and double
+// danda (॥) used in Hindi/Sanskrit verse, plus standard punctuation — so poetry, dohas, and
+// shlokas get a real breathing rhythm between lines instead of running together. This is a
+// basic, well-supported SSML element (unlike style tags below), so it's reliable.
+function insertPoeticPauses(text, breakMs = 350) {
+  const parts = text.split(/([।॥?!.\n]+)/);
+  let result = "";
+  for (const part of parts) {
+    if (!part) continue;
+    result += part;
+    if (/[।॥?!.\n]/.test(part)) result += `<break time="${breakMs}ms"/>`;
+  }
+  return result;
+}
+
+// Wraps text in <mstts:express-as>, Azure's SSML tag for speaking styles (cheerful, empathetic,
+// etc). IMPORTANT HONESTY NOTE: this is a real Azure Speech feature, confirmed to exist for
+// hi-IN-SwaraNeural specifically (styles: cheerful, empathetic, newscast) — but our TTS client
+// is the free, unofficial Edge "Read Aloud" endpoint, not the paid Azure Speech API, and this
+// hasn't been verified to actually change the audio on that free endpoint. It's included
+// because it's harmless to try (the endpoint should just ignore an unrecognized tag rather than
+// error), not because it's confirmed working.
+function wrapExpressStyle(text, style) {
+  if (!style) return text;
+  return `<mstts:express-as style="${style}">${text}</mstts:express-as>`;
+}
+
 async function generateVoice(text, voiceOptions, outPath) {
   const opts = voiceOptions || {};
   const voiceId = opts.voiceId || DEFAULT_VOICE_ID;
@@ -52,7 +79,10 @@ async function generateVoice(text, voiceOptions, outPath) {
   const prosody = {};
   if (opts.pitch) prosody.pitch = opts.pitch;
   if (opts.rate) prosody.rate = opts.rate;
-  const { audioStream } = tts.toStream(text, prosody);
+  let ssmlText = text;
+  if (opts.poeticPauses) ssmlText = insertPoeticPauses(ssmlText, opts.pauseMs);
+  if (opts.style) ssmlText = wrapExpressStyle(ssmlText, opts.style);
+  const { audioStream } = tts.toStream(ssmlText, prosody);
   await new Promise((resolve, reject) => {
     const chunks = [];
     audioStream.on("data", (chunk) => chunks.push(chunk));
@@ -540,13 +570,13 @@ async function tick() {
   try {
     job.status = "processing";
     if (job.type === "scene_generate") {
-      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, frameFitMode, sfxFile } = job.payload;
+      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, sfxFile } = job.payload;
       const audioPath = path.join(OUTPUT_DIR, `${sceneId}-voice.mp3`);
       const audioMixedPath = path.join(OUTPUT_DIR, `${sceneId}-voice-mixed.mp3`);
       const videoPath = path.join(OUTPUT_DIR, `${sceneId}-visual.mp4`);
       const mergedPath = path.join(OUTPUT_DIR, `${sceneId}-merged.mp4`);
 
-      await generateVoice(narration, { voiceId, pitch: voicePitch, rate: voiceRate }, audioPath);
+      await generateVoice(narration, { voiceId, pitch: voicePitch, rate: voiceRate, style: voiceStyle, poeticPauses, pauseMs }, audioPath);
       let finalAudioPath = audioPath;
       if (sfxFile) {
         await mixSceneSfx(audioPath, sfxFile, audioMixedPath);
@@ -740,12 +770,12 @@ app.post("/uploads", upload.single("file"), (req, res) => {
 });
 
 app.post("/jobs/generate-scene", (req, res) => {
-  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, frameFitMode, sfxFile } = req.body || {};
+  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, sfxFile } = req.body || {};
   const hasVisualFiles = Array.isArray(visualFiles) && visualFiles.length > 0;
   if (!sceneId || !narration || !(imagePrompt || hasVisualFiles)) {
     return res.status(400).json({ error: "sceneId, narration, and either imagePrompt (for AI generation) or visualFiles (for manual uploads) are required" });
   }
-  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, visualFiles, frameFitMode, sfxFile });
+  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, sfxFile });
   res.json({ jobId: id });
 });
 
