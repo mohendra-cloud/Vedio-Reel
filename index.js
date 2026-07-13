@@ -71,8 +71,7 @@ function wrapExpressStyle(text, style) {
   return `<mstts:express-as style="${style}">${text}</mstts:express-as>`;
 }
 
-async function generateVoice(text, voiceOptions, outPath) {
-  const opts = voiceOptions || {};
+async function attemptGenerateVoice(text, opts, outPath) {
   const voiceId = opts.voiceId || DEFAULT_VOICE_ID;
   const tts = new MsEdgeTTS();
   await tts.setMetadata(voiceId, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
@@ -92,6 +91,29 @@ async function generateVoice(text, voiceOptions, outPath) {
     });
     audioStream.on("error", reject);
   });
+}
+
+async function generateVoice(text, voiceOptions, outPath) {
+  const opts = voiceOptions || {};
+  const voiceId = opts.voiceId || DEFAULT_VOICE_ID;
+  const maxRetries = 3;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      await attemptGenerateVoice(text, opts, outPath);
+      break;
+    } catch (e) {
+      // A dropped connection to Microsoft's free TTS endpoint (before it signals synthesis is
+      // actually complete) is a real, known instability of that endpoint — a fresh attempt is
+      // the correct recovery, since it's a network hiccup, not a problem with the request
+      // itself. Retrying won't help a genuinely bad request, so only retry this specific case.
+      const isConnectionIssue = /Stream closed before|WebSocket error/i.test(e.message || "");
+      if (isConnectionIssue && attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1))); // 1s, 2s, 3s
+        continue;
+      }
+      throw e;
+    }
+  }
   // A real MP3 with any actual speech in it is at minimum a few KB. A file this small almost
   // always means the TTS engine returned little or no real audio — most commonly because the
   // narration's language doesn't match the selected voice (e.g. Hindi/Devanagari text sent to
