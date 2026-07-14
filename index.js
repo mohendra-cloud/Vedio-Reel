@@ -273,7 +273,25 @@ const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".webm", ".m4v", ".avi"]);
 // file, whatever its original resolution or aspect ratio, gets normalized to the same common
 // frame (letterboxed/pillarboxed, never stretched or distorted) so scenes always concatenate
 // cleanly no matter what mix of photos and videos went into them.
-async function prepareUploadedVisual(filenames, audioPath, outPath, frameFitMode) {
+// Builds the zoompan filter string for a given transition type — each expression was tested
+// directly against real rendered frames before being included here.
+function buildTransitionFilter(transition, frames, w, h) {
+  switch (transition) {
+    case "zoom-out":
+      return `zoompan=z='if(eq(on,0),1.15,max(1.15-0.0008*on,1.0))':d=${frames}:s=${w}x${h}`;
+    case "pan-left":
+      return `zoompan=z=1.15:x='(iw-iw/zoom)*(1-on/${frames})':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}`;
+    case "pan-right":
+      return `zoompan=z=1.15:x='(iw-iw/zoom)*(on/${frames})':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}`;
+    case "static":
+      return null; // no animation filter needed at all
+    case "zoom-in":
+    default:
+      return `zoompan=z='min(zoom+0.0008,1.15)':d=${frames}:s=${w}x${h}`;
+  }
+}
+
+async function prepareUploadedVisual(filenames, audioPath, outPath, frameFitMode, transition) {
   const list = Array.isArray(filenames) ? filenames : [filenames];
   if (list.length === 0) throw new Error("No uploaded visual files given for this scene");
   const duration = await ffprobeDuration(audioPath);
@@ -291,12 +309,15 @@ async function prepareUploadedVisual(filenames, audioPath, outPath, frameFitMode
     if (VIDEO_EXTENSIONS.has(ext)) {
       await normalizeVideoToDuration(srcPath, clipPath, perClip, frameFitMode);
     } else {
-      // Still image — normalize to the common frame, then animate with a gentle Ken Burns
-      // zoom for its share of the narration.
+      // Still image — normalize to the common frame, then animate with the chosen transition.
       const frames = Math.max(FRAME_RATE, Math.round(perClip * FRAME_RATE));
+      const transitionFilter = buildTransitionFilter(transition, frames, FRAME_W, FRAME_H);
+      const filterChain = transitionFilter
+        ? `${fitFillFilter(FRAME_W, FRAME_H, frameFitMode)};[outv]${transitionFilter},format=yuv420p[outv2]`
+        : `${fitFillFilter(FRAME_W, FRAME_H, frameFitMode)};[outv]format=yuv420p[outv2]`;
       await ffmpeg([
         "-loop", "1", "-i", srcPath,
-        "-filter_complex", `${fitFillFilter(FRAME_W, FRAME_H, frameFitMode)};[outv]zoompan=z='min(zoom+0.0008,1.15)':d=${frames}:s=${FRAME_W}x${FRAME_H},format=yuv420p[outv2]`,
+        "-filter_complex", filterChain,
         "-map", "[outv2]",
         "-t", String(perClip), "-r", String(FRAME_RATE),
         "-c:v", "libx264", "-preset", "veryfast",
@@ -526,9 +547,17 @@ async function mixSceneSfx(narrationPath, sfxFilename, outPath) {
 // match, at reduced volume so the narration stays clearly audible. This is the real
 // implementation behind the "Background music" picker — a genuine uploaded track, not a
 // preset name with nothing behind it.
-async function mixBackgroundMusic(videoPath, musicFilename, outPath, volume) {
-  const musicPath = path.join(OUTPUT_DIR, musicFilename);
-  if (!fs.existsSync(musicPath)) throw new Error(`Uploaded music file not found: ${musicFilename}`);
+const MUSIC_PRESETS_DIR = path.join(process.cwd(), "music-presets");
+const MUSIC_PRESETS = {
+  none: { label: "None", file: null },
+  peaceful: { label: "Peaceful — soft, slow", file: "preset-peaceful.mp3" },
+  bhakti: { label: "Bhakti / Devotional — drone, Indian style", file: "preset-bhakti.mp3" },
+  energetic: { label: "Energetic — upbeat, bright", file: "preset-energetic.mp3" },
+};
+
+async function mixBackgroundMusic(videoPath, musicFilename, outPath, volume, isPreset) {
+  const musicPath = isPreset ? path.join(MUSIC_PRESETS_DIR, musicFilename) : path.join(OUTPUT_DIR, musicFilename);
+  if (!fs.existsSync(musicPath)) throw new Error(`Music file not found: ${musicFilename}`);
   const duration = await ffprobeDuration(videoPath);
   const musicVolume = Number.isFinite(volume) ? Math.max(0, Math.min(1, volume)) : 0.18;
   await ffmpeg([
@@ -568,8 +597,25 @@ const RESOLUTION_TIERS = {
 // together so they stay in sync. Any combination can be a no-op; only the filters actually
 // needed run. Resize uses the same fit-fill technique as scene normalization — full content
 // preserved, no cropping, blurred fill instead of black bars.
+// Builds an optional decorative frame filter — applied last, after resize, so the corner
+// radius / vignette strength look right relative to the actual final frame, not an
+// intermediate size. Rounded corners paint directly in RGB (no alpha channel), which is what
+// makes them safe for standard MP4/H.264 delivery — an alpha-channel version was tested first
+// and rejected because most video containers/players don't handle transparency correctly.
+function buildFrameStyleFilter(frameStyle) {
+  if (frameStyle === "vignette") return "vignette=PI/4";
+  if (frameStyle === "rounded") {
+    const r = 40; // corner radius in pixels — matches the value actually tested
+    const cornerCond = `gt(abs(W/2-X),W/2-${r})*gt(abs(H/2-Y),H/2-${r})`;
+    const dist = `hypot(W/2-${r}-abs(W/2-X),H/2-${r}-abs(H/2-Y))`;
+    const keep = (ch) => `if(${cornerCond},if(lte(${dist},${r}),${ch}(X,Y),0),${ch}(X,Y))`;
+    return `geq=r='${keep("r")}':g='${keep("g")}':b='${keep("b")}'`;
+  }
+  return null;
+}
+
 async function applyFinalAdjustments(inputPath, outputPath, opts) {
-  const { speed = 1, platformPreset = "none", resolution, brightness = 0, contrast = 1, saturation = 1, frameFitMode } = opts || {};
+  const { speed = 1, platformPreset = "none", resolution, brightness = 0, contrast = 1, saturation = 1, frameFitMode, frameStyle } = opts || {};
   const platform = PLATFORM_PRESETS[platformPreset] || PLATFORM_PRESETS.none;
   const target = platform.width && platform.height ? platform : (RESOLUTION_TIERS[resolution] || null);
   const speedClamped = Math.max(0.25, Math.min(4, Number(speed) || 1));
@@ -578,6 +624,8 @@ async function applyFinalAdjustments(inputPath, outputPath, opts) {
   if (brightness !== 0 || contrast !== 1 || saturation !== 1) {
     simpleFilters.push(`eq=brightness=${brightness}:contrast=${contrast}:saturation=${saturation}`);
   }
+  const frameStyleFilter = buildFrameStyleFilter(frameStyle);
+  if (frameStyleFilter) simpleFilters.push(frameStyleFilter);
   if (speedClamped !== 1) {
     simpleFilters.push(`setpts=${(1 / speedClamped).toFixed(6)}*PTS`);
   }
@@ -647,7 +695,7 @@ async function tick() {
   try {
     job.status = "processing";
     if (job.type === "scene_generate") {
-      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, sfxFile } = job.payload;
+      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, transition, sfxFile } = job.payload;
       const audioPath = path.join(OUTPUT_DIR, `${sceneId}-voice.mp3`);
       const audioMixedPath = path.join(OUTPUT_DIR, `${sceneId}-voice-mixed.mp3`);
       const videoPath = path.join(OUTPUT_DIR, `${sceneId}-visual.mp4`);
@@ -661,7 +709,7 @@ async function tick() {
       }
       job.progress = 40;
       if (visualFiles && visualFiles.length > 0) {
-        await prepareUploadedVisual(visualFiles, finalAudioPath, videoPath, frameFitMode);
+        await prepareUploadedVisual(visualFiles, finalAudioPath, videoPath, frameFitMode, transition);
       } else {
         const targetDuration = await ffprobeDuration(finalAudioPath);
         await generateVisual(imagePrompt, videoPath, targetDuration, frameFitMode);
@@ -673,8 +721,8 @@ async function tick() {
       job.status = "complete";
     } else if (job.type === "final_export") {
       const {
-        sceneFiles, captionTexts, musicFile, musicVolume,
-        speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode,
+        sceneFiles, captionTexts, musicFile, musicPreset, musicVolume,
+        speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode, frameStyle,
         showCaptions, captionSize, captionFontColor, captionBgColor,
         exportFormat,
       } = job.payload; // sceneFiles: filenames already in OUTPUT_DIR
@@ -706,14 +754,18 @@ async function tick() {
       job.progress = 30;
 
       let postMusicPath = concatPath;
-      if (musicFile) {
-        await mixBackgroundMusic(concatPath, musicFile, musicedPath, musicVolume);
+      const activeMusicFile = musicPreset && MUSIC_PRESETS[musicPreset] && MUSIC_PRESETS[musicPreset].file
+        ? MUSIC_PRESETS[musicPreset].file
+        : musicFile;
+      const activeMusicIsPreset = !!(musicPreset && MUSIC_PRESETS[musicPreset] && MUSIC_PRESETS[musicPreset].file);
+      if (activeMusicFile) {
+        await mixBackgroundMusic(concatPath, activeMusicFile, musicedPath, musicVolume, activeMusicIsPreset);
         fs.unlinkSync(concatPath);
         postMusicPath = musicedPath;
       }
       job.progress = 50;
 
-      await applyFinalAdjustments(postMusicPath, adjustedPath, { speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode });
+      await applyFinalAdjustments(postMusicPath, adjustedPath, { speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode, frameStyle });
       fs.unlinkSync(postMusicPath);
       job.progress = 70;
 
@@ -853,12 +905,12 @@ app.post("/uploads", upload.single("file"), (req, res) => {
 });
 
 app.post("/jobs/generate-scene", (req, res) => {
-  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, sfxFile } = req.body || {};
+  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, transition, sfxFile } = req.body || {};
   const hasVisualFiles = Array.isArray(visualFiles) && visualFiles.length > 0;
   if (!sceneId || !narration || !(imagePrompt || hasVisualFiles)) {
     return res.status(400).json({ error: "sceneId, narration, and either imagePrompt (for AI generation) or visualFiles (for manual uploads) are required" });
   }
-  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, sfxFile });
+  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, transition, sfxFile });
   res.json({ jobId: id });
 });
 
@@ -867,10 +919,15 @@ app.get("/platform-presets", (req, res) => {
   res.json({ presets });
 });
 
+app.get("/music-presets", (req, res) => {
+  const presets = Object.entries(MUSIC_PRESETS).map(([id, p]) => ({ id, label: p.label }));
+  res.json({ presets });
+});
+
 app.post("/jobs/export", (req, res) => {
   const {
-    sceneFiles, captionTexts, musicFile, musicVolume,
-    speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode,
+    sceneFiles, captionTexts, musicFile, musicPreset, musicVolume,
+    speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode, frameStyle,
     showCaptions, captionSize, captionFontColor, captionBgColor,
     exportFormat,
   } = req.body || {};
@@ -878,8 +935,8 @@ app.post("/jobs/export", (req, res) => {
     return res.status(400).json({ error: "sceneFiles must be a non-empty array of filenames from prior scene_generate jobs" });
   }
   const id = createJob("final_export", {
-    sceneFiles, captionTexts, musicFile, musicVolume,
-    speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode,
+    sceneFiles, captionTexts, musicFile, musicPreset, musicVolume,
+    speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode, frameStyle,
     showCaptions, captionSize, captionFontColor, captionBgColor,
     exportFormat,
   });
