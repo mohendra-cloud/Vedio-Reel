@@ -13,6 +13,7 @@ dotenv.config();
 
 const PORT = process.env.PORT || 8080;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const PEXELS_API_KEY = process.env.PEXELS_API_KEY;
 const RUNWAY_KEY = process.env.RUNWAYML_API_SECRET;
 const ACCESS_TOKEN = process.env.BACKEND_ACCESS_TOKEN;
 
@@ -1050,6 +1051,56 @@ app.post("/uploads", upload.single("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "file is required (multipart field name: file)" });
   res.json({ filename: req.file.filename });
 });
+
+// Suggests real, legitimately-licensed stock photos for a scene based on its narration text.
+// Uses Gemini to turn the narration into a short, effective search query, then searches
+// Pexels (verified as a real, free API specifically licensed for exactly this kind of reuse,
+// with required attribution) filtered by the requested orientation. Returns candidates for
+// the user to review and choose from — nothing is added automatically.
+app.post("/suggest-photos", async (req, res) => {
+  const { narration, orientation } = req.body || {};
+  if (!narration || !narration.trim()) return res.status(400).json({ error: "narration is required" });
+  if (!PEXELS_API_KEY) return res.status(400).json({ error: "PEXELS_API_KEY is not set on the backend — get a free key at pexels.com/api and add it in Railway's Variables tab" });
+  try {
+    const queryPrompt = `Give me ONE short stock-photo search phrase (3-6 words, plain English, no punctuation) that captures the main visual subject of this narration line. Reply with ONLY the phrase, nothing else.\n\nNarration: "${narration}"`;
+    const query = (await generateText(queryPrompt)).trim().replace(/["\n]/g, "");
+    const orientationParam = orientation === "vertical" ? "portrait" : orientation === "landscape" ? "landscape" : "";
+    const pexelsUrl = `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=8${orientationParam ? `&orientation=${orientationParam}` : ""}`;
+    const pexelsRes = await fetch(pexelsUrl, { headers: { Authorization: PEXELS_API_KEY } });
+    if (!pexelsRes.ok) throw new Error(`Pexels error ${pexelsRes.status}: ${await pexelsRes.text()}`);
+    const data = await pexelsRes.json();
+    const results = (data.photos || []).map((p) => ({
+      id: p.id,
+      thumbnailUrl: p.src.medium,
+      fullUrl: p.src.large2x || p.src.original,
+      photographer: p.photographer,
+      photographerUrl: p.photographer_url,
+      width: p.width,
+      height: p.height,
+    }));
+    res.json({ query, results });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Downloads a chosen suggested photo server-side and saves it exactly like a manual upload,
+// so it plugs into the existing visualFiles pipeline with no special-casing needed downstream.
+app.post("/suggest-photos/use", async (req, res) => {
+  const { fullUrl } = req.body || {};
+  if (!fullUrl) return res.status(400).json({ error: "fullUrl is required" });
+  try {
+    const imgRes = await fetch(fullUrl);
+    if (!imgRes.ok) throw new Error(`Could not download image: ${imgRes.status}`);
+    const buf = Buffer.from(await imgRes.arrayBuffer());
+    const filename = `upload-${randomUUID()}.jpg`;
+    fs.writeFileSync(path.join(OUTPUT_DIR, filename), buf);
+    res.json({ filename });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
 
 app.post("/jobs/generate-scene", (req, res) => {
   const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, transition, sfxFile } = req.body || {};
