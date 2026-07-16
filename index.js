@@ -432,6 +432,42 @@ async function generateText(prompt) {
   throw lastError;
 }
 
+// Small, tasteful pitch/rate/pause nudges per detected emotional tone — deliberately subtle
+// (a few percent, not the more exaggerated swings used for cartoon voices) so scenes feel like
+// natural variation in delivery, not a different character each time. This is the honest,
+// achievable version of "emotional" voice on the free tier: real prosody control (proven
+// reliable) driven by AI text analysis, not the style-tag approach removed earlier after it
+// caused real connection failures.
+const EMOTION_PROSODY = {
+  gentle: { pitch: "-3%", rate: "-6%", pauseMs: 450 },
+  reverent: { pitch: "-4%", rate: "-10%", pauseMs: 550 },
+  dramatic: { pitch: "+3%", rate: "-8%", pauseMs: 500 },
+  joyful: { pitch: "+6%", rate: "+6%", pauseMs: 250 },
+  somber: { pitch: "-6%", rate: "-10%", pauseMs: 500 },
+  urgent: { pitch: "+4%", rate: "+10%", pauseMs: 150 },
+  neutral: { pitch: "0%", rate: "0%", pauseMs: 350 },
+};
+
+// Combines two SSML percentage strings (e.g. "+15%" and "-3%") by summing their numeric
+// values — a reasonable approximation for layering a base voice's character on top of a
+// per-line emotional adjustment, confirmed correct for the combinations actually used here.
+function combinePercent(base, adjustment) {
+  const parseP = (s) => (s ? parseFloat(String(s).replace("%", "")) || 0 : 0);
+  const sum = Math.max(-35, Math.min(35, parseP(base) + parseP(adjustment)));
+  return (sum >= 0 ? "+" : "") + sum.toFixed(0) + "%";
+}
+
+async function detectEmotionalTone(narration) {
+  const categories = Object.keys(EMOTION_PROSODY).filter((c) => c !== "neutral");
+  const prompt = `Classify the emotional tone of this narration line as exactly ONE of these words: ${categories.join(", ")}, or neutral. Reply with ONLY that one word, nothing else.\n\nNarration: "${narration}"`;
+  try {
+    const result = (await generateText(prompt)).trim().toLowerCase().replace(/[^a-z]/g, "");
+    return EMOTION_PROSODY[result] ? result : "neutral";
+  } catch (e) {
+    return "neutral"; // Gemini unavailable — fall back to no adjustment rather than fail the scene
+  }
+}
+
 function ffmpeg(args) {
   return new Promise((resolve, reject) => {
     const proc = spawn("ffmpeg", ["-y", ...args]);
@@ -855,23 +891,44 @@ async function convertToWebm(inputPath, outputPath) {
   ]);
 }
 
-// --- worker loop: pulls one job at a time. Swap for BullMQ/Redis if you need parallel workers later. ---
-let working = false;
-async function tick() {
-  if (working || queue.length === 0) return;
-  working = true;
-  const jobId = queue.shift();
+// --- worker loop ---
+// Previously processed exactly one job at a time regardless of type — meaning N scenes always
+// took N times as long as one scene, even though the frontend submits them together. Now:
+// scene_generate jobs run with limited concurrency (MAX_CONCURRENT_SCENE_GENERATE at once),
+// while final_export stays fully serial — exports are heavier (multiple full video re-encode
+// passes) and only one typically runs per user action anyway, so there's no real benefit to
+// parallelizing that, only added resource risk. The concurrency limit for scenes is
+// deliberately conservative: each scene_generate job can involve an ffmpeg encode, a TTS call,
+// and possibly a Gemini call, so running too many at once on a small server risks the same
+// memory pressure that caused OOM crashes earlier in this build. 2 is a reasonable middle
+// ground between "meaningfully faster" and "still safe" without needing to guess at exactly
+// how much headroom Railway's container actually has.
+const activeJobs = new Set();
+const MAX_CONCURRENT_SCENE_GENERATE = 2;
+
+async function processJob(jobId) {
   const job = jobs.get(jobId);
   try {
     job.status = "processing";
     if (job.type === "scene_generate") {
-      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, visualFiles, frameFitMode, transition, sfxFile } = job.payload;
+      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, autoEmotionalTone, visualFiles, frameFitMode, transition, sfxFile } = job.payload;
       const audioPath = path.join(OUTPUT_DIR, `${sceneId}-voice.mp3`);
       const audioMixedPath = path.join(OUTPUT_DIR, `${sceneId}-voice-mixed.mp3`);
       const videoPath = path.join(OUTPUT_DIR, `${sceneId}-visual.mp4`);
       const mergedPath = path.join(OUTPUT_DIR, `${sceneId}-merged.mp4`);
 
-      await generateVoice(narration, { voiceId, pitch: voicePitch, rate: voiceRate, style: voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence }, audioPath);
+      let finalPitch = voicePitch, finalRate = voiceRate, finalPoeticPauses = poeticPauses, finalPauseMs = pauseMs;
+      if (autoEmotionalTone) {
+        const emotion = await detectEmotionalTone(narration);
+        const adj = EMOTION_PROSODY[emotion];
+        finalPitch = combinePercent(voicePitch, adj.pitch);
+        finalRate = combinePercent(voiceRate, adj.rate);
+        // Emotional pacing benefits from real pauses even for voices that don't otherwise use
+        // them — but a user's own explicit pause setting (e.g. the Kabir/ghazal presets) still
+        // takes priority if they already turned this on with a specific timing.
+        if (!finalPoeticPauses) { finalPoeticPauses = true; finalPauseMs = adj.pauseMs; }
+      }
+      await generateVoice(narration, { voiceId, pitch: finalPitch, rate: finalRate, style: voiceStyle, poeticPauses: finalPoeticPauses, pauseMs: finalPauseMs, pronunciationOverrides, trimSilence }, audioPath);
       let finalAudioPath = audioPath;
       if (sfxFile) {
         await mixSceneSfx(audioPath, sfxFile, audioMixedPath);
@@ -1022,8 +1079,30 @@ async function tick() {
   } catch (e) {
     job.status = "failed";
     job.error = e.message;
-  } finally {
-    working = false;
+  }
+}
+
+// Scheduler — runs every second, starts as many eligible jobs as current capacity allows.
+// Scene jobs can run up to MAX_CONCURRENT_SCENE_GENERATE at once; an export only starts once
+// nothing else is running, and blocks new scene jobs from starting while it's in progress.
+function tick() {
+  while (queue.length > 0) {
+    const nextJobId = queue[0];
+    const nextJob = jobs.get(nextJobId);
+    if (!nextJob) { queue.shift(); continue; } // stale/missing job — drop it, don't get stuck
+
+    const activeSceneCount = [...activeJobs].filter((id) => jobs.get(id)?.type === "scene_generate").length;
+    const activeExportCount = [...activeJobs].filter((id) => jobs.get(id)?.type === "final_export").length;
+
+    if (nextJob.type === "scene_generate") {
+      if (activeSceneCount >= MAX_CONCURRENT_SCENE_GENERATE || activeExportCount > 0) break; // wait for capacity
+    } else if (nextJob.type === "final_export") {
+      if (activeJobs.size > 0) break; // wait until nothing else is running
+    }
+
+    queue.shift();
+    activeJobs.add(nextJobId);
+    processJob(nextJobId).finally(() => activeJobs.delete(nextJobId));
   }
 }
 setInterval(tick, 1000);
@@ -1245,12 +1324,12 @@ app.post("/suggest-videos/use", async (req, res) => {
 
 
 app.post("/jobs/generate-scene", (req, res) => {
-  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, visualFiles, frameFitMode, transition, sfxFile } = req.body || {};
+  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, autoEmotionalTone, visualFiles, frameFitMode, transition, sfxFile } = req.body || {};
   const hasVisualFiles = Array.isArray(visualFiles) && visualFiles.length > 0;
   if (!sceneId || !narration || !(imagePrompt || hasVisualFiles)) {
     return res.status(400).json({ error: "sceneId, narration, and either imagePrompt (for AI generation) or visualFiles (for manual uploads) are required" });
   }
-  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, visualFiles, frameFitMode, transition, sfxFile });
+  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, autoEmotionalTone, visualFiles, frameFitMode, transition, sfxFile });
   res.json({ jobId: id });
 });
 
