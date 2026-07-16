@@ -101,6 +101,40 @@ function wrapExpressStyle(text, style) {
   return `<mstts:express-as style="${style}">${text}</mstts:express-as>`;
 }
 
+// Substitutes specific words with a phonetic respelling before sending text to TTS — for
+// proper nouns and Sanskrit terms the voice engine wasn't trained heavily on and mispronounces.
+// Case-insensitive, but word-boundary-safe: overriding "Vishnu" won't incorrectly match inside
+// "Vishnuji" (confirmed by direct test before wiring this in). This ONLY affects what gets
+// sent to the TTS engine — captions and the .srt file keep showing the original spelling,
+// since they're built from the scene's stored narration text, never from this substituted copy.
+function applyPronunciationOverrides(text, overrides) {
+  if (!overrides || !Array.isArray(overrides) || overrides.length === 0) return text;
+  let result = text;
+  for (const { word, replacement } of overrides) {
+    if (!word || !replacement) continue;
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(`\\b${escaped}\\b`, "gi");
+    result = result.replace(regex, replacement);
+  }
+  return result;
+}
+
+// Trims leading/trailing silence from generated narration — TTS engines routinely leave a beat
+// of dead air at the start/end of a clip. -40dB threshold is conservative (real speech is much
+// louder), and only start/end are trimmed, never the middle, so natural pauses within the
+// narration are preserved. Confirmed by direct test: a clip with 0.5s + 3s + 0.8s of
+// silence-speech-silence correctly trimmed down to just the speech portion.
+async function trimSilence(inputPath) {
+  const trimmedPath = inputPath.replace(/\.mp3$/, "-trimmed.mp3");
+  await ffmpeg([
+    "-i", inputPath,
+    "-af", "silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.05:stop_periods=1:stop_threshold=-40dB:stop_silence=0.05",
+    trimmedPath,
+  ]);
+  fs.unlinkSync(inputPath);
+  fs.renameSync(trimmedPath, inputPath);
+}
+
 async function attemptGenerateVoice(text, opts, outPath) {
   const voiceId = opts.voiceId || DEFAULT_VOICE_ID;
   const tts = new MsEdgeTTS();
@@ -108,7 +142,7 @@ async function attemptGenerateVoice(text, opts, outPath) {
   const prosody = {};
   if (opts.pitch) prosody.pitch = opts.pitch;
   if (opts.rate) prosody.rate = opts.rate;
-  let ssmlText = text;
+  let ssmlText = applyPronunciationOverrides(text, opts.pronunciationOverrides);
   if (opts.poeticPauses) ssmlText = insertPoeticPauses(ssmlText, opts.pauseMs);
   if (opts.style) ssmlText = wrapExpressStyle(ssmlText, opts.style);
   const { audioStream } = tts.toStream(ssmlText, prosody);
@@ -143,6 +177,9 @@ async function generateVoice(text, voiceOptions, outPath) {
       }
       throw e;
     }
+  }
+  if (opts.trimSilence !== false) {
+    await trimSilence(outPath); // on by default — matches every other quality-of-life fix in this pipeline
   }
   // A real MP3 with any actual speech in it is at minimum a few KB. A file this small almost
   // always means the TTS engine returned little or no real audio — most commonly because the
@@ -810,13 +847,13 @@ async function tick() {
   try {
     job.status = "processing";
     if (job.type === "scene_generate") {
-      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, transition, sfxFile } = job.payload;
+      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, visualFiles, frameFitMode, transition, sfxFile } = job.payload;
       const audioPath = path.join(OUTPUT_DIR, `${sceneId}-voice.mp3`);
       const audioMixedPath = path.join(OUTPUT_DIR, `${sceneId}-voice-mixed.mp3`);
       const videoPath = path.join(OUTPUT_DIR, `${sceneId}-visual.mp4`);
       const mergedPath = path.join(OUTPUT_DIR, `${sceneId}-merged.mp4`);
 
-      await generateVoice(narration, { voiceId, pitch: voicePitch, rate: voiceRate, style: voiceStyle, poeticPauses, pauseMs }, audioPath);
+      await generateVoice(narration, { voiceId, pitch: voicePitch, rate: voiceRate, style: voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence }, audioPath);
       let finalAudioPath = audioPath;
       if (sfxFile) {
         await mixSceneSfx(audioPath, sfxFile, audioMixedPath);
@@ -949,14 +986,14 @@ async function tick() {
 
       if (exportFormat === "GIF") {
         await convertToGif(postTitlePath, finalPath);
-        fs.unlinkSync(postCaptionPath);
+        fs.unlinkSync(postTitlePath);
       } else if (exportFormat === "WebM") {
-        await convertToWebm(postCaptionPath, finalPath);
-        fs.unlinkSync(postCaptionPath);
+        await convertToWebm(postTitlePath, finalPath);
+        fs.unlinkSync(postTitlePath);
       } else if (exportFormat === "MOV") {
-        fs.renameSync(postCaptionPath, finalPath); // MOV can hold the same h264/aac stream as-is
+        fs.renameSync(postTitlePath, finalPath); // MOV can hold the same h264/aac stream as-is
       } else {
-        fs.renameSync(postCaptionPath, finalPath);
+        fs.renameSync(postTitlePath, finalPath);
       }
 
       job.progress = 100;
@@ -1190,12 +1227,12 @@ app.post("/suggest-videos/use", async (req, res) => {
 
 
 app.post("/jobs/generate-scene", (req, res) => {
-  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, transition, sfxFile } = req.body || {};
+  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, visualFiles, frameFitMode, transition, sfxFile } = req.body || {};
   const hasVisualFiles = Array.isArray(visualFiles) && visualFiles.length > 0;
   if (!sceneId || !narration || !(imagePrompt || hasVisualFiles)) {
     return res.status(400).json({ error: "sceneId, narration, and either imagePrompt (for AI generation) or visualFiles (for manual uploads) are required" });
   }
-  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, transition, sfxFile });
+  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, visualFiles, frameFitMode, transition, sfxFile });
   res.json({ jobId: id });
 });
 
