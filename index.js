@@ -412,16 +412,26 @@ function wrapCaptionText(text, maxCharsPerLine = 42) {
   return lines.join("\n");
 }
 
-// Noto Sans Devanagari — chosen because it renders both Devanagari script (Hindi, Sanskrit)
-// and standard Latin text correctly in the same font, confirmed by direct testing. DejaVu Sans
-// (the previous font) has no Devanagari glyphs at all, which produced garbled boxes instead of
-// text for any Hindi/Sanskrit captions.
-// Bundled directly in the repo (fonts/NotoSansDevanagari-Bold.ttf) rather than relying on
-// an apt-get install succeeding at deploy time — this removes an entire class of "did the
-// package installer actually work on this platform" uncertainty. Renders both Devanagari
-// (Hindi, Sanskrit) and standard Latin text correctly, confirmed by direct rendering test.
+// CORRECTION to the claim below: further testing (objective OCR verification, not just visual
+// inspection) proved this font does NOT reliably render plain Latin/English text — even simple
+// text with zero Devanagari produced garbage glyphs. The earlier "confirmed by direct testing"
+// claim was based on a short mixed-script phrase and didn't catch this. Real fix: detect each
+// caption's dominant script and use the correct font for THAT segment — Devanagari font for
+// Devanagari text, DejaVu Sans (confirmed via OCR to render English correctly) for Latin text.
 const CAPTION_FONT = path.join(process.cwd(), "fonts", "NotoSansDevanagari-Bold.ttf");
+const LATIN_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
 const CAPTION_SIZES = { small: 20, medium: 26, large: 34 };
+
+// Picks the right font for a piece of text based on its dominant script — checked by counting
+// Devanagari-range characters (Hindi/Sanskrit) against total non-space characters. A caption
+// that's mostly one script but has a few words of the other will still render that minority
+// portion incorrectly (no single free font reliably covers both), but this correctly handles
+// the common case of a whole caption being one language or the other.
+function fontForText(text) {
+  const devanagariCount = (text.match(/[\u0900-\u097F]/g) || []).length;
+  const totalChars = text.replace(/\s/g, "").length || 1;
+  return devanagariCount / totalChars > 0.3 ? CAPTION_FONT : LATIN_FONT;
+}
 
 // Converts a "#RRGGBB" hex string to ffmpeg's "0xRRGGBB" color syntax, falling back to a
 // safe default for anything that isn't a strictly valid hex color — these values come from
@@ -494,7 +504,7 @@ async function burnTitleCard(inputPath, outputPath, text, durationSec, fontSize,
   const color = toFFmpegColor(fontColor, "white");
   const box = toFFmpegColor(bgColor, "black") + "@0.6";
   const escaped = escapeDrawtext(text.trim());
-  const drawtext = `drawtext=fontfile=${CAPTION_FONT}:text='${escaped}':fontcolor=${color}:fontsize=${fontSize || 48}:box=1:boxcolor=${box}:boxborderw=16:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,0,${durationSec})'`;
+  const drawtext = `drawtext=fontfile=${fontForText(text)}:text='${escaped}':fontcolor=${color}:fontsize=${fontSize || 48}:box=1:boxcolor=${box}:boxborderw=16:x=(w-text_w)/2:y=(h-text_h)/2:enable='between(t,0,${durationSec})'`;
   await ffmpeg([
     "-i", inputPath,
     "-vf", drawtext,
@@ -561,7 +571,7 @@ async function burnCaptionsWithTiming(inputPath, outputPath, segments, captionSi
   const bottomMargin = Math.round(h * 0.04); // scales with frame height instead of a fixed pixel value
   const filters = usable.map((s) => {
     const text = escapeDrawtext(wrapCaptionText(s.text.trim(), maxCharsPerLine));
-    return `drawtext=fontfile=${CAPTION_FONT}:text='${text}':fontcolor=${fontColor}:fontsize=${fontsize}:line_spacing=6:box=1:boxcolor=${boxColor}:boxborderw=12:x=(w-text_w)/2:y=h-th-${bottomMargin}:enable='between(t,${s.start.toFixed(3)},${s.end.toFixed(3)})'`;
+    return `drawtext=fontfile=${fontForText(s.text)}:text='${text}':fontcolor=${fontColor}:fontsize=${fontsize}:line_spacing=6:box=1:boxcolor=${boxColor}:boxborderw=12:x=(w-text_w)/2:y=h-th-${bottomMargin}:enable='between(t,${s.start.toFixed(3)},${s.end.toFixed(3)})'`;
   });
   await ffmpeg([
     "-i", inputPath,
