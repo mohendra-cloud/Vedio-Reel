@@ -1101,6 +1101,61 @@ app.post("/suggest-photos/use", async (req, res) => {
   }
 });
 
+// Same idea as /suggest-photos, but searches Pexels' video library instead — a separate
+// endpoint (not a shared "media type" flag) because the response shape genuinely differs:
+// videos have a duration and multiple quality renditions (video_files) rather than one image.
+app.post("/suggest-videos", async (req, res) => {
+  const { narration, orientation } = req.body || {};
+  if (!narration || !narration.trim()) return res.status(400).json({ error: "narration is required" });
+  if (!PEXELS_API_KEY) return res.status(400).json({ error: "PEXELS_API_KEY is not set on the backend — get a free key at pexels.com/api and add it in Railway's Variables tab" });
+  try {
+    const queryPrompt = `Give me ONE short stock-video search phrase (3-6 words, plain English, no punctuation) that captures the main visual subject of this narration line. Reply with ONLY the phrase, nothing else.\n\nNarration: "${narration}"`;
+    const query = (await generateText(queryPrompt)).trim().replace(/["\n]/g, "");
+    const orientationParam = orientation === "vertical" ? "portrait" : orientation === "landscape" ? "landscape" : "";
+    const pexelsUrl = `https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=8${orientationParam ? `&orientation=${orientationParam}` : ""}`;
+    const pexelsRes = await fetch(pexelsUrl, { headers: { Authorization: PEXELS_API_KEY } });
+    if (!pexelsRes.ok) throw new Error(`Pexels error ${pexelsRes.status}: ${await pexelsRes.text()}`);
+    const data = await pexelsRes.json();
+    const results = (data.videos || []).map((v) => {
+      // Pick a moderate-resolution rendition rather than the largest (often 4K) — keeps
+      // downloads and downstream ffmpeg processing fast, since every visual gets normalized
+      // to the project frame size anyway, so extra source resolution is wasted work.
+      const files = (v.video_files || []).filter((f) => f.file_type === "video/mp4" && f.width);
+      const sorted = files.sort((a, b) => a.width - b.width);
+      const chosen = sorted.find((f) => f.width >= 960) || sorted[sorted.length - 1] || files[0];
+      return {
+        id: v.id,
+        thumbnailUrl: v.image,
+        fullUrl: chosen ? chosen.link : null,
+        duration: v.duration,
+        photographer: (v.user && v.user.name) || "Unknown",
+        photographerUrl: (v.user && v.user.url) || "https://www.pexels.com",
+        width: v.width,
+        height: v.height,
+      };
+    }).filter((v) => v.fullUrl);
+    res.json({ query, results });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Downloads a chosen suggested video server-side and saves it exactly like a manual upload.
+app.post("/suggest-videos/use", async (req, res) => {
+  const { fullUrl } = req.body || {};
+  if (!fullUrl) return res.status(400).json({ error: "fullUrl is required" });
+  try {
+    const vidRes = await fetch(fullUrl);
+    if (!vidRes.ok) throw new Error(`Could not download video: ${vidRes.status}`);
+    const buf = Buffer.from(await vidRes.arrayBuffer());
+    const filename = `upload-${randomUUID()}.mp4`;
+    fs.writeFileSync(path.join(OUTPUT_DIR, filename), buf);
+    res.json({ filename });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
 
 app.post("/jobs/generate-scene", (req, res) => {
   const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, visualFiles, frameFitMode, transition, sfxFile } = req.body || {};
