@@ -1052,6 +1052,18 @@ app.post("/uploads", upload.single("file"), (req, res) => {
   res.json({ filename: req.file.filename });
 });
 
+// Extracts a reasonable stock-search query directly from narration text, no AI needed — used
+// as a fallback when Gemini is unavailable, so photo/video suggestions still work during a
+// Gemini outage instead of failing the whole feature over an unrelated service being down.
+const STOPWORDS = new Set(["the","a","an","and","or","but","of","to","in","on","at","for","with","is","are","was","were","be","been","i","we","you","he","she","it","they","this","that","my","our","his","her","their","not","just","had","have","has","who","one","back","then","than","so"]);
+function fallbackSearchQuery(narration) {
+  const words = narration
+    .replace(/[^\w\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 2 && !STOPWORDS.has(w.toLowerCase()));
+  return words.slice(0, 5).join(" ") || narration.slice(0, 40);
+}
+
 // Suggests real, legitimately-licensed stock photos for a scene based on its narration text.
 // Uses Gemini to turn the narration into a short, effective search query, then searches
 // Pexels (verified as a real, free API specifically licensed for exactly this kind of reuse,
@@ -1062,8 +1074,13 @@ app.post("/suggest-photos", async (req, res) => {
   if (!narration || !narration.trim()) return res.status(400).json({ error: "narration is required" });
   if (!PEXELS_API_KEY) return res.status(400).json({ error: "PEXELS_API_KEY is not set on the backend — get a free key at pexels.com/api and add it in Railway's Variables tab" });
   try {
-    const queryPrompt = `Give me ONE short stock-photo search phrase (3-6 words, plain English, no punctuation) that captures the main visual subject of this narration line. Reply with ONLY the phrase, nothing else.\n\nNarration: "${narration}"`;
-    const query = (await generateText(queryPrompt)).trim().replace(/["\n]/g, "");
+    let query;
+    try {
+      const queryPrompt = `Give me ONE short stock-photo search phrase (3-6 words, plain English, no punctuation) that captures the main visual subject of this narration line. Reply with ONLY the phrase, nothing else.\n\nNarration: "${narration}"`;
+      query = (await generateText(queryPrompt)).trim().replace(/["\n]/g, "");
+    } catch (e) {
+      query = fallbackSearchQuery(narration); // Gemini unavailable — degrade gracefully instead of failing
+    }
     const orientationParam = orientation === "vertical" ? "portrait" : orientation === "landscape" ? "landscape" : "";
     const pexelsUrl = `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}&per_page=8${orientationParam ? `&orientation=${orientationParam}` : ""}`;
     const pexelsRes = await fetch(pexelsUrl, { headers: { Authorization: PEXELS_API_KEY } });
@@ -1109,8 +1126,13 @@ app.post("/suggest-videos", async (req, res) => {
   if (!narration || !narration.trim()) return res.status(400).json({ error: "narration is required" });
   if (!PEXELS_API_KEY) return res.status(400).json({ error: "PEXELS_API_KEY is not set on the backend — get a free key at pexels.com/api and add it in Railway's Variables tab" });
   try {
-    const queryPrompt = `Give me ONE short stock-video search phrase (3-6 words, plain English, no punctuation) that captures the main visual subject of this narration line. Reply with ONLY the phrase, nothing else.\n\nNarration: "${narration}"`;
-    const query = (await generateText(queryPrompt)).trim().replace(/["\n]/g, "");
+    let query;
+    try {
+      const queryPrompt = `Give me ONE short stock-video search phrase (3-6 words, plain English, no punctuation) that captures the main visual subject of this narration line. Reply with ONLY the phrase, nothing else.\n\nNarration: "${narration}"`;
+      query = (await generateText(queryPrompt)).trim().replace(/["\n]/g, "");
+    } catch (e) {
+      query = fallbackSearchQuery(narration); // Gemini unavailable — degrade gracefully instead of failing
+    }
     const orientationParam = orientation === "vertical" ? "portrait" : orientation === "landscape" ? "landscape" : "";
     const pexelsUrl = `https://api.pexels.com/videos/search?query=${encodeURIComponent(query)}&per_page=8${orientationParam ? `&orientation=${orientationParam}` : ""}`;
     const pexelsRes = await fetch(pexelsUrl, { headers: { Authorization: PEXELS_API_KEY } });
