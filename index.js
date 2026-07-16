@@ -120,19 +120,37 @@ function applyPronunciationOverrides(text, overrides) {
 }
 
 // Trims leading/trailing silence from generated narration — TTS engines routinely leave a beat
-// of dead air at the start/end of a clip. -40dB threshold is conservative (real speech is much
-// louder), and only start/end are trimmed, never the middle, so natural pauses within the
-// narration are preserved. Confirmed by direct test: a clip with 0.5s + 3s + 0.8s of
-// silence-speech-silence correctly trimmed down to just the speech portion.
+// of dead air at the start/end of a clip. IMPORTANT: an earlier version of this used -40dB,
+// tuned against an unrealistically loud test tone — real TTS output is quieter, and that
+// threshold was proven (by direct reproduction) to destroy a realistic 3.55s clip down to
+// 0.168s, misclassifying almost the entire thing as silence. Fixed two ways: a safer -55dB
+// threshold (verified to correctly preserve the same realistic clip in full), AND a hard
+// safety check below that discards the trim entirely if it ever removes a suspicious amount —
+// so even an unanticipated edge case with different audio characteristics can't silently ship
+// a destroyed clip again.
 async function trimSilence(inputPath) {
+  const originalDuration = await ffprobeDuration(inputPath);
   const trimmedPath = inputPath.replace(/\.mp3$/, "-trimmed.mp3");
-  await ffmpeg([
-    "-i", inputPath,
-    "-af", "silenceremove=start_periods=1:start_threshold=-40dB:start_silence=0.05:stop_periods=1:stop_threshold=-40dB:stop_silence=0.05",
-    trimmedPath,
-  ]);
-  fs.unlinkSync(inputPath);
-  fs.renameSync(trimmedPath, inputPath);
+  try {
+    await ffmpeg([
+      "-i", inputPath,
+      "-af", "silenceremove=start_periods=1:start_threshold=-55dB:start_silence=0.05:stop_periods=1:stop_threshold=-55dB:stop_silence=0.05",
+      trimmedPath,
+    ]);
+    const trimmedDuration = await ffprobeDuration(trimmedPath);
+    // Real leading/trailing silence is a fraction of a second to maybe a couple seconds at
+    // most — never the majority of the clip. If more than half got removed, or the result is
+    // under a second, that's not "trimmed silence," that's lost speech — keep the original.
+    if (trimmedDuration < 1 || trimmedDuration < originalDuration * 0.5) {
+      fs.unlinkSync(trimmedPath);
+      return; // leave inputPath untouched
+    }
+    fs.unlinkSync(inputPath);
+    fs.renameSync(trimmedPath, inputPath);
+  } catch (e) {
+    if (fs.existsSync(trimmedPath)) fs.unlinkSync(trimmedPath);
+    // If trimming itself fails for any reason, the untouched original is still there — fine.
+  }
 }
 
 async function attemptGenerateVoice(text, opts, outPath) {
