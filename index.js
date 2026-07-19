@@ -153,6 +153,21 @@ async function trimSilence(inputPath) {
   }
 }
 
+// Serializes actual network calls to Microsoft's free TTS endpoint specifically — even though
+// scenes now process with limited concurrency (2 at once) for speed, having 2 simultaneous
+// WebSocket connections to the SAME free/unofficial endpoint is a likely explanation for the
+// "Stream closed before synthesis completed" errors becoming more persistent after concurrency
+// was added. This only serializes the TTS call itself; visual generation and other scene work
+// still run concurrently — just not two TTS connections at the exact same moment. Confirmed by
+// direct test: calls correctly queue one after another rather than firing simultaneously, and
+// a failed call doesn't block subsequent ones (no deadlock).
+let ttsLock = Promise.resolve();
+function withTtsLock(fn) {
+  const run = ttsLock.then(fn, fn);
+  ttsLock = run.catch(() => {});
+  return run;
+}
+
 async function attemptGenerateVoice(text, opts, outPath) {
   const voiceId = opts.voiceId || DEFAULT_VOICE_ID;
   const tts = new MsEdgeTTS();
@@ -163,8 +178,8 @@ async function attemptGenerateVoice(text, opts, outPath) {
   let ssmlText = applyPronunciationOverrides(text, opts.pronunciationOverrides);
   if (opts.poeticPauses) ssmlText = insertPoeticPauses(ssmlText, opts.pauseMs);
   if (opts.style) ssmlText = wrapExpressStyle(ssmlText, opts.style);
-  const { audioStream } = tts.toStream(ssmlText, prosody);
-  await new Promise((resolve, reject) => {
+  await withTtsLock(() => new Promise((resolve, reject) => {
+    const { audioStream } = tts.toStream(ssmlText, prosody);
     const chunks = [];
     audioStream.on("data", (chunk) => chunks.push(chunk));
     audioStream.on("close", () => {
@@ -172,7 +187,7 @@ async function attemptGenerateVoice(text, opts, outPath) {
       resolve();
     });
     audioStream.on("error", reject);
-  });
+  }));
 }
 
 async function generateVoice(text, voiceOptions, outPath) {
