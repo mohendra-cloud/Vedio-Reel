@@ -168,6 +168,25 @@ function withTtsLock(fn) {
   return run;
 }
 
+// Escapes the 5 standard XML entities in narration text before it's embedded in SSML. This is
+// a critical fix: msedge-tts inserts text into its SSML template completely raw (confirmed by
+// reading its source), so any narration containing a literal &, <, or > — entirely plausible
+// in ordinary writing ("iron & nickel", "greater than 5000°C") — produces genuinely invalid
+// XML, confirmed directly with a real XML parser. This explains why some scenes failed
+// consistently on every retry: the same malformed request was being sent every single time,
+// which no amount of retrying could fix, since the problem was the request itself, not network
+// flakiness. Must run AFTER pronunciation overrides (still user content) but BEFORE
+// insertPoeticPauses/wrapExpressStyle, since those insert legitimate SSML markup of our own
+// that must NOT be escaped.
+function escapeXmlText(text) {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
 async function attemptGenerateVoice(text, opts, outPath) {
   const voiceId = opts.voiceId || DEFAULT_VOICE_ID;
   const tts = new MsEdgeTTS();
@@ -175,7 +194,7 @@ async function attemptGenerateVoice(text, opts, outPath) {
   const prosody = {};
   if (opts.pitch) prosody.pitch = opts.pitch;
   if (opts.rate) prosody.rate = opts.rate;
-  let ssmlText = applyPronunciationOverrides(text, opts.pronunciationOverrides);
+  let ssmlText = escapeXmlText(applyPronunciationOverrides(text, opts.pronunciationOverrides));
   if (opts.poeticPauses) ssmlText = insertPoeticPauses(ssmlText, opts.pauseMs);
   if (opts.style) ssmlText = wrapExpressStyle(ssmlText, opts.style);
   await withTtsLock(() => new Promise((resolve, reject) => {
