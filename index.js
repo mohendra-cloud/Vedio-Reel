@@ -178,7 +178,7 @@ async function attemptGenerateVoice(text, opts, outPath) {
 async function generateVoice(text, voiceOptions, outPath) {
   const opts = voiceOptions || {};
   const voiceId = opts.voiceId || DEFAULT_VOICE_ID;
-  const maxRetries = 3;
+  const maxRetries = 5;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       await attemptGenerateVoice(text, opts, outPath);
@@ -188,10 +188,18 @@ async function generateVoice(text, voiceOptions, outPath) {
       // actually complete) is a real, known instability of that endpoint — a fresh attempt is
       // the correct recovery, since it's a network hiccup, not a problem with the request
       // itself. Retrying won't help a genuinely bad request, so only retry this specific case.
+      // Bumped from 3 to 5 retries after this exact error was reported recurring even with 3 —
+      // free TTS endpoints can have longer instability windows than a quick 3-try backoff covers.
       const isConnectionIssue = /Stream closed before|WebSocket error/i.test(e.message || "");
       if (isConnectionIssue && attempt < maxRetries) {
-        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1))); // 1s, 2s, 3s
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1))); // 1s, 2s, 3s, 4s, 5s
         continue;
+      }
+      if (isConnectionIssue) {
+        throw new Error(
+          `Microsoft's free voice service kept dropping the connection after ${maxRetries + 1} attempts. ` +
+          `This is a known instability of the free tier, not a problem with your script or voice choice. Wait a minute and try regenerating this scene again.`
+        );
       }
       throw e;
     }
