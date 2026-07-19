@@ -187,7 +187,7 @@ function escapeXmlText(text) {
     .replace(/'/g, "&apos;");
 }
 
-async function attemptGenerateVoice(text, opts, outPath) {
+async function attemptGenerateVoice(text, opts, outPath, logPrefix) {
   const voiceId = opts.voiceId || DEFAULT_VOICE_ID;
   const tts = new MsEdgeTTS();
   await tts.setMetadata(voiceId, OUTPUT_FORMAT.AUDIO_24KHZ_48KBITRATE_MONO_MP3);
@@ -197,16 +197,24 @@ async function attemptGenerateVoice(text, opts, outPath) {
   let ssmlText = escapeXmlText(applyPronunciationOverrides(text, opts.pronunciationOverrides));
   if (opts.poeticPauses) ssmlText = insertPoeticPauses(ssmlText, opts.pauseMs);
   if (opts.style) ssmlText = wrapExpressStyle(ssmlText, opts.style);
-  await withTtsLock(() => new Promise((resolve, reject) => {
-    const { audioStream } = tts.toStream(ssmlText, prosody);
-    const chunks = [];
-    audioStream.on("data", (chunk) => chunks.push(chunk));
-    audioStream.on("close", () => {
-      fs.writeFileSync(outPath, Buffer.concat(chunks));
-      resolve();
-    });
-    audioStream.on("error", reject);
-  }));
+  const startedAt = Date.now();
+  console.log(`${logPrefix} starting TTS call — voice=${voiceId} textLen=${text.length} ssmlLen=${ssmlText.length}`);
+  try {
+    await withTtsLock(() => new Promise((resolve, reject) => {
+      const { audioStream } = tts.toStream(ssmlText, prosody);
+      const chunks = [];
+      audioStream.on("data", (chunk) => chunks.push(chunk));
+      audioStream.on("close", () => {
+        fs.writeFileSync(outPath, Buffer.concat(chunks));
+        resolve();
+      });
+      audioStream.on("error", reject);
+    }));
+    console.log(`${logPrefix} succeeded in ${Date.now() - startedAt}ms`);
+  } catch (e) {
+    console.log(`${logPrefix} FAILED after ${Date.now() - startedAt}ms — raw error: ${e.stack || e.message || e}`);
+    throw e;
+  }
 }
 
 // Splits long narration into smaller pieces at sentence boundaries (English and Devanagari
@@ -230,11 +238,11 @@ function chunkNarrationForTts(text, maxChunkLen = 220) {
 
 // The actual per-attempt synthesis with retry — unchanged from before, just extracted so it
 // can run once per chunk instead of once per whole (possibly very long) narration.
-async function generateVoiceChunk(text, opts, outPath) {
+async function generateVoiceChunk(text, opts, outPath, logPrefix) {
   const maxRetries = 5;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      await attemptGenerateVoice(text, opts, outPath);
+      await attemptGenerateVoice(text, opts, outPath, `${logPrefix} attempt ${attempt + 1}/${maxRetries + 1}`);
       return;
     } catch (e) {
       // A dropped connection to Microsoft's free TTS endpoint (before it signals synthesis is
@@ -247,6 +255,7 @@ async function generateVoiceChunk(text, opts, outPath) {
         continue;
       }
       if (isConnectionIssue) {
+        console.log(`${logPrefix} EXHAUSTED all ${maxRetries + 1} attempts — text was: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`);
         throw new Error(
           `Microsoft's free voice service kept dropping the connection after ${maxRetries + 1} attempts. ` +
           `This is a known instability of the free tier, not a problem with your script or voice choice. Wait a minute and try regenerating this scene again.`
@@ -259,6 +268,7 @@ async function generateVoiceChunk(text, opts, outPath) {
 
 async function generateVoice(text, voiceOptions, outPath) {
   const opts = voiceOptions || {};
+  const sceneLabel = path.basename(outPath).replace(/\.mp3$/, "");
   // Long narration means a longer-held connection to Microsoft's free TTS endpoint, which
   // means more exposure to exactly the kind of drop this retry logic exists to handle. Above
   // this length, split into smaller pieces — each with its own short-lived connection and its
@@ -266,12 +276,14 @@ async function generateVoice(text, voiceOptions, outPath) {
   // was added after a specific scene (802 characters, no XML-special-characters — ruling out
   // the earlier escaping fix as the cause here) failed consistently across 6 retries.
   const CHUNK_THRESHOLD = 300;
+  console.log(`[voice:${sceneLabel}] narration is ${text.length} chars — ${text.length > CHUNK_THRESHOLD ? "will be chunked" : "single call"}`);
   if (text.length > CHUNK_THRESHOLD) {
     const textChunks = chunkNarrationForTts(text);
+    console.log(`[voice:${sceneLabel}] split into ${textChunks.length} chunks`);
     const tempPaths = [];
     for (let i = 0; i < textChunks.length; i++) {
       const chunkPath = outPath.replace(/\.mp3$/, `-chunk${i}.mp3`);
-      await generateVoiceChunk(textChunks[i], opts, chunkPath);
+      await generateVoiceChunk(textChunks[i], opts, chunkPath, `[voice:${sceneLabel} chunk ${i + 1}/${textChunks.length}]`);
       if (opts.trimSilence !== false) await trimSilence(chunkPath); // trim EACH chunk's own dead air — a single trim at the end would miss gaps between chunks
       tempPaths.push(chunkPath);
     }
@@ -282,7 +294,7 @@ async function generateVoice(text, voiceOptions, outPath) {
       tempPaths.forEach((p) => fs.unlinkSync(p));
     }
   } else {
-    await generateVoiceChunk(text, opts, outPath);
+    await generateVoiceChunk(text, opts, outPath, `[voice:${sceneLabel}]`);
     if (opts.trimSilence !== false) {
       await trimSilence(outPath); // on by default — matches every other quality-of-life fix in this pipeline
     }
