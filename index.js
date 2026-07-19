@@ -209,21 +209,38 @@ async function attemptGenerateVoice(text, opts, outPath) {
   }));
 }
 
-async function generateVoice(text, voiceOptions, outPath) {
-  const opts = voiceOptions || {};
-  const voiceId = opts.voiceId || DEFAULT_VOICE_ID;
+// Splits long narration into smaller pieces at sentence boundaries (English and Devanagari
+// punctuation both), never mid-sentence — confirmed by direct test that all content survives
+// exactly when chunks are rejoined.
+function chunkNarrationForTts(text, maxChunkLen = 220) {
+  const sentences = text.split(/(?<=[.!?।॥])\s+/);
+  const chunks = [];
+  let current = "";
+  for (const sentence of sentences) {
+    if (current && current.length + sentence.length + 1 > maxChunkLen) {
+      chunks.push(current.trim());
+      current = sentence;
+    } else {
+      current = current ? current + " " + sentence : sentence;
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+  return chunks;
+}
+
+// The actual per-attempt synthesis with retry — unchanged from before, just extracted so it
+// can run once per chunk instead of once per whole (possibly very long) narration.
+async function generateVoiceChunk(text, opts, outPath) {
   const maxRetries = 5;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       await attemptGenerateVoice(text, opts, outPath);
-      break;
+      return;
     } catch (e) {
       // A dropped connection to Microsoft's free TTS endpoint (before it signals synthesis is
       // actually complete) is a real, known instability of that endpoint — a fresh attempt is
       // the correct recovery, since it's a network hiccup, not a problem with the request
       // itself. Retrying won't help a genuinely bad request, so only retry this specific case.
-      // Bumped from 3 to 5 retries after this exact error was reported recurring even with 3 —
-      // free TTS endpoints can have longer instability windows than a quick 3-try backoff covers.
       const isConnectionIssue = /Stream closed before|WebSocket error/i.test(e.message || "");
       if (isConnectionIssue && attempt < maxRetries) {
         await new Promise((r) => setTimeout(r, 1000 * (attempt + 1))); // 1s, 2s, 3s, 4s, 5s
@@ -238,8 +255,37 @@ async function generateVoice(text, voiceOptions, outPath) {
       throw e;
     }
   }
-  if (opts.trimSilence !== false) {
-    await trimSilence(outPath); // on by default — matches every other quality-of-life fix in this pipeline
+}
+
+async function generateVoice(text, voiceOptions, outPath) {
+  const opts = voiceOptions || {};
+  // Long narration means a longer-held connection to Microsoft's free TTS endpoint, which
+  // means more exposure to exactly the kind of drop this retry logic exists to handle. Above
+  // this length, split into smaller pieces — each with its own short-lived connection and its
+  // own independent retry — instead of one long connection that has more time to fail. This
+  // was added after a specific scene (802 characters, no XML-special-characters — ruling out
+  // the earlier escaping fix as the cause here) failed consistently across 6 retries.
+  const CHUNK_THRESHOLD = 300;
+  if (text.length > CHUNK_THRESHOLD) {
+    const textChunks = chunkNarrationForTts(text);
+    const tempPaths = [];
+    for (let i = 0; i < textChunks.length; i++) {
+      const chunkPath = outPath.replace(/\.mp3$/, `-chunk${i}.mp3`);
+      await generateVoiceChunk(textChunks[i], opts, chunkPath);
+      if (opts.trimSilence !== false) await trimSilence(chunkPath); // trim EACH chunk's own dead air — a single trim at the end would miss gaps between chunks
+      tempPaths.push(chunkPath);
+    }
+    if (tempPaths.length === 1) {
+      fs.renameSync(tempPaths[0], outPath);
+    } else {
+      await concatAudioSegments(tempPaths, outPath);
+      tempPaths.forEach((p) => fs.unlinkSync(p));
+    }
+  } else {
+    await generateVoiceChunk(text, opts, outPath);
+    if (opts.trimSilence !== false) {
+      await trimSilence(outPath); // on by default — matches every other quality-of-life fix in this pipeline
+    }
   }
   // A real MP3 with any actual speech in it is at minimum a few KB. A file this small almost
   // always means the TTS engine returned little or no real audio — most commonly because the
