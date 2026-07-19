@@ -213,6 +213,77 @@ async function generateVoice(text, voiceOptions, outPath) {
   }
 }
 
+// Splits a scene's narration into per-speaker segments using "Name: dialogue" tags — the
+// standard screenplay convention. A line with no tag is appended to whichever speaker came
+// before it (so a character's dialogue can wrap onto a second line naturally). If NO speaker
+// tags are found anywhere, the whole narration is treated as one untagged segment — this is
+// what makes the feature fully backward compatible: existing single-narrator scenes are
+// completely unaffected, confirmed by direct test.
+function parseSpeakerSegments(narration) {
+  const lines = narration.split(/\n/).map((l) => l.trim()).filter(Boolean);
+  const segments = [];
+  const speakerPattern = /^([A-Za-z][A-Za-z\s]{0,30}):\s*(.+)$/;
+  let hasAnySpeaker = false;
+  for (const line of lines) {
+    const m = line.match(speakerPattern);
+    if (m) {
+      hasAnySpeaker = true;
+      segments.push({ speaker: m[1].trim(), text: m[2].trim() });
+    } else if (segments.length > 0) {
+      segments[segments.length - 1].text += " " + line;
+    } else {
+      segments.push({ speaker: null, text: line });
+    }
+  }
+  return hasAnySpeaker ? segments : [{ speaker: null, text: narration.trim() }];
+}
+
+// Joins per-speaker audio clips into one continuous scene audio file. Uses the concat
+// demuxer with -c copy (fast, lossless — no re-encode needed since all segments already share
+// the same codec/format from generateVoice).
+async function concatAudioSegments(segmentPaths, outPath) {
+  const listPath = outPath + ".txt";
+  fs.writeFileSync(listPath, segmentPaths.map((p) => `file '${p}'`).join("\n"));
+  await ffmpeg(["-f", "concat", "-safe", "0", "-i", listPath, "-c", "copy", outPath]);
+  fs.unlinkSync(listPath);
+}
+
+// Generates a full scene's audio from multiple speakers, each in their assigned voice, and
+// returns the REAL measured duration of each segment — this is what makes captions for
+// dialogue scenes accurate: instead of the text-length approximation used for a single block
+// of narration, each speaker's actual spoken duration (which varies by voice/rate) drives its
+// own caption timing. Confirmed by direct test: concatenated file duration exactly matches
+// the sum of individually-measured segment durations, so no drift can creep in.
+async function generateDialogueAudio(narration, cast, baseVoiceOptions, outPath) {
+  const segments = parseSpeakerSegments(narration);
+  const castMap = new Map((cast || []).map((c) => [c.name.toLowerCase(), c]));
+  const tempPaths = [];
+  const result = [];
+  let cumulative = 0;
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const character = seg.speaker ? castMap.get(seg.speaker.toLowerCase()) : null;
+    const voiceOptions = character
+      ? { ...baseVoiceOptions, voiceId: character.voiceId || baseVoiceOptions.voiceId, pitch: character.pitch, rate: character.rate }
+      : baseVoiceOptions;
+    const segPath = outPath.replace(/\.mp3$/, `-seg${i}.mp3`);
+    await generateVoice(seg.text, voiceOptions, segPath);
+    const duration = await ffprobeDuration(segPath);
+    tempPaths.push(segPath);
+    result.push({ speaker: seg.speaker, text: seg.text, start: cumulative, end: cumulative + duration });
+    cumulative += duration;
+  }
+
+  if (tempPaths.length === 1) {
+    fs.renameSync(tempPaths[0], outPath);
+  } else {
+    await concatAudioSegments(tempPaths, outPath);
+    tempPaths.forEach((p) => fs.unlinkSync(p));
+  }
+  return result;
+}
+
 // Common target frame — every scene's visual, regardless of source (Runway, uploaded video,
 // or uploaded image), gets normalized to exactly this, so scenes never mismatch when concatenated.
 const FRAME_W = 1280;
@@ -705,6 +776,44 @@ async function mixSceneSfx(narrationPath, sfxFilename, outPath) {
   ]);
 }
 
+// Rhythmic accent layer, mixed quietly under narration — same honest approach as the music
+// presets: original synthesized patterns (sine-wave "kicks" + filtered-noise "taps"), never
+// sampled from any real drum kit or copyrighted recording. Distinct from background music
+// (continuous melody) — this is a subtle pulse matched to a scene's pacing/mood.
+const BEAT_PRESETS_DIR = path.join(process.cwd(), "beat-presets");
+const BEAT_PRESETS = {
+  none: { label: "None", file: null },
+  gentle: { label: "Gentle — slow, soft pulse", file: "preset-gentle.mp3" },
+  dramatic: { label: "Dramatic — building tension", file: "preset-dramatic.mp3" },
+  energetic: { label: "Energetic — fast, driving", file: "preset-energetic.mp3" },
+};
+
+async function mixSceneBeat(narrationPath, beatKey, outPath) {
+  const preset = BEAT_PRESETS[beatKey];
+  if (!preset || !preset.file) { fs.copyFileSync(narrationPath, outPath); return; }
+  const beatPath = path.join(BEAT_PRESETS_DIR, preset.file);
+  if (!fs.existsSync(beatPath)) { fs.copyFileSync(narrationPath, outPath); return; } // missing file — don't fail the whole scene over a rhythm accent
+  const duration = await ffprobeDuration(narrationPath);
+  await ffmpeg([
+    "-i", narrationPath,
+    "-stream_loop", "-1", "-i", beatPath,
+    "-filter_complex", `[1:a]volume=0.22,atrim=0:${duration}[beat];[0:a][beat]amix=inputs=2:duration=first:dropout_transition=1[aout]`,
+    "-map", "[aout]",
+    "-t", String(duration),
+    outPath,
+  ]);
+}
+
+async function detectBeatStyle(narration) {
+  const prompt = `Classify what kind of rhythmic musical pulse would best suit this narration line, as exactly ONE of: gentle, dramatic, energetic, or none (if no rhythm fits at all). Reply with ONLY that one word.\n\nNarration: "${narration}"`;
+  try {
+    const result = (await generateText(prompt)).trim().toLowerCase().replace(/[^a-z]/g, "");
+    return BEAT_PRESETS[result] ? result : "none";
+  } catch (e) {
+    return "none"; // Gemini unavailable — no beat rather than failing the scene
+  }
+}
+
 // Mixes an uploaded music track under the final video's narration audio, looped/trimmed to
 // match, at reduced volume so the narration stays clearly audible. This is the real
 // implementation behind the "Background music" picker — a genuine uploaded track, not a
@@ -911,7 +1020,7 @@ async function processJob(jobId) {
   try {
     job.status = "processing";
     if (job.type === "scene_generate") {
-      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, autoEmotionalTone, visualFiles, frameFitMode, transition, sfxFile } = job.payload;
+      const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, autoEmotionalTone, cast, beatStyle, autoBeats, visualFiles, frameFitMode, transition, sfxFile } = job.payload;
       const audioPath = path.join(OUTPUT_DIR, `${sceneId}-voice.mp3`);
       const audioMixedPath = path.join(OUTPUT_DIR, `${sceneId}-voice-mixed.mp3`);
       const videoPath = path.join(OUTPUT_DIR, `${sceneId}-visual.mp4`);
@@ -928,11 +1037,28 @@ async function processJob(jobId) {
         // takes priority if they already turned this on with a specific timing.
         if (!finalPoeticPauses) { finalPoeticPauses = true; finalPauseMs = adj.pauseMs; }
       }
-      await generateVoice(narration, { voiceId, pitch: finalPitch, rate: finalRate, style: voiceStyle, poeticPauses: finalPoeticPauses, pauseMs: finalPauseMs, pronunciationOverrides, trimSilence }, audioPath);
+      const baseVoiceOptions = { voiceId, pitch: finalPitch, rate: finalRate, style: voiceStyle, poeticPauses: finalPoeticPauses, pauseMs: finalPauseMs, pronunciationOverrides, trimSilence };
+      let dialogueSegments = null;
+      if (cast && cast.length > 0) {
+        // Multi-character scene — each speaker gets their own assigned voice, and the real
+        // measured duration of each segment (not a text-length guess) drives caption timing.
+        dialogueSegments = await generateDialogueAudio(narration, cast, baseVoiceOptions, audioPath);
+      } else {
+        await generateVoice(narration, baseVoiceOptions, audioPath);
+      }
       let finalAudioPath = audioPath;
       if (sfxFile) {
         await mixSceneSfx(audioPath, sfxFile, audioMixedPath);
         finalAudioPath = audioMixedPath;
+      }
+      let resolvedBeatStyle = beatStyle;
+      if (autoBeats && !resolvedBeatStyle) {
+        resolvedBeatStyle = await detectBeatStyle(narration);
+      }
+      if (resolvedBeatStyle && resolvedBeatStyle !== "none") {
+        const audioBeatPath = path.join(OUTPUT_DIR, `${sceneId}-voice-beat.mp3`);
+        await mixSceneBeat(finalAudioPath, resolvedBeatStyle, audioBeatPath);
+        finalAudioPath = audioBeatPath;
       }
       job.progress = 40;
       if (visualFiles && visualFiles.length > 0) {
@@ -945,10 +1071,11 @@ async function processJob(jobId) {
       await mergeSceneAV(videoPath, finalAudioPath, mergedPath);
       job.progress = 100;
       job.resultUrl = `/files/${path.basename(mergedPath)}`;
+      job.dialogueSegments = dialogueSegments;
       job.status = "complete";
     } else if (job.type === "final_export") {
       const {
-        sceneFiles, captionTexts, musicFile, musicPreset, musicVolume,
+        sceneFiles, captionTexts, sceneDialogueSegments, musicFile, musicPreset, musicVolume,
         speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode, frameStyle,
         showCaptions, captionSize, captionFontColor, captionBgColor, ducking,
         watermarkFile, watermarkPosition, watermarkSize,
@@ -965,18 +1092,28 @@ async function processJob(jobId) {
       const finalPath = path.join(OUTPUT_DIR, `export-${job.id}.${finalExt}`);
       const fullPaths = sceneFiles.map((f) => path.join(OUTPUT_DIR, f));
 
-      // Work out each scene's time window in the final timeline BEFORE concatenating, then
-      // split that scene's narration into smaller chunks (paragraphs, or sentences if there
-      // are no paragraph breaks) so captions appear and disappear progressively through the
-      // scene instead of showing the whole block the entire time.
+      // Work out each scene's time window in the final timeline BEFORE concatenating. For a
+      // dialogue scene (real per-speaker durations available from generation), those exact
+      // timings are used directly — this is more accurate than the text-length approximation
+      // below, since different characters' voices speak at different rates. Regular
+      // single-narrator scenes still use the text-length split, unaffected by this feature.
       let cumulative = 0;
       const rawSegments = [];
       for (let i = 0; i < fullPaths.length; i++) {
         const dur = await ffprobeDuration(fullPaths[i]);
-        const sceneText = (captionTexts && captionTexts[i]) || "";
-        if (sceneText.trim()) {
-          const chunks = splitIntoCaptionChunks(sceneText);
-          rawSegments.push(...allocateChunkTimings(chunks, cumulative, cumulative + dur));
+        const dialogueForScene = sceneDialogueSegments && sceneDialogueSegments[i];
+        if (dialogueForScene && dialogueForScene.length > 0) {
+          dialogueForScene.forEach((seg) => {
+            if (seg.text && seg.text.trim()) {
+              rawSegments.push({ text: seg.text, start: cumulative + seg.start, end: cumulative + seg.end });
+            }
+          });
+        } else {
+          const sceneText = (captionTexts && captionTexts[i]) || "";
+          if (sceneText.trim()) {
+            const chunks = splitIntoCaptionChunks(sceneText);
+            rawSegments.push(...allocateChunkTimings(chunks, cumulative, cumulative + dur));
+          }
         }
         cumulative += dur;
       }
@@ -1324,12 +1461,12 @@ app.post("/suggest-videos/use", async (req, res) => {
 
 
 app.post("/jobs/generate-scene", (req, res) => {
-  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, autoEmotionalTone, visualFiles, frameFitMode, transition, sfxFile } = req.body || {};
+  const { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, autoEmotionalTone, cast, beatStyle, autoBeats, visualFiles, frameFitMode, transition, sfxFile } = req.body || {};
   const hasVisualFiles = Array.isArray(visualFiles) && visualFiles.length > 0;
   if (!sceneId || !narration || !(imagePrompt || hasVisualFiles)) {
     return res.status(400).json({ error: "sceneId, narration, and either imagePrompt (for AI generation) or visualFiles (for manual uploads) are required" });
   }
-  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, autoEmotionalTone, visualFiles, frameFitMode, transition, sfxFile });
+  const id = createJob("scene_generate", { sceneId, narration, imagePrompt, voiceId, voicePitch, voiceRate, voiceStyle, poeticPauses, pauseMs, pronunciationOverrides, trimSilence, autoEmotionalTone, cast, beatStyle, autoBeats, visualFiles, frameFitMode, transition, sfxFile });
   res.json({ jobId: id });
 });
 
@@ -1343,9 +1480,14 @@ app.get("/music-presets", (req, res) => {
   res.json({ presets });
 });
 
+app.get("/beat-presets", (req, res) => {
+  const presets = Object.entries(BEAT_PRESETS).map(([id, p]) => ({ id, label: p.label }));
+  res.json({ presets });
+});
+
 app.post("/jobs/export", (req, res) => {
   const {
-    sceneFiles, captionTexts, musicFile, musicPreset, musicVolume,
+    sceneFiles, captionTexts, sceneDialogueSegments, musicFile, musicPreset, musicVolume,
     speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode, frameStyle,
     showCaptions, captionSize, captionFontColor, captionBgColor, ducking,
     watermarkFile, watermarkPosition, watermarkSize,
@@ -1356,7 +1498,7 @@ app.post("/jobs/export", (req, res) => {
     return res.status(400).json({ error: "sceneFiles must be a non-empty array of filenames from prior scene_generate jobs" });
   }
   const id = createJob("final_export", {
-    sceneFiles, captionTexts, musicFile, musicPreset, musicVolume,
+    sceneFiles, captionTexts, sceneDialogueSegments, musicFile, musicPreset, musicVolume,
     speed, platformPreset, resolution, brightness, contrast, saturation, frameFitMode, frameStyle,
     showCaptions, captionSize, captionFontColor, captionBgColor, ducking,
     watermarkFile, watermarkPosition, watermarkSize,
